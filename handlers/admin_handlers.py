@@ -547,10 +547,26 @@ async def reject_payment(callback: CallbackQuery):
     if not details or details["status"] != config.STATUS_CHECKING:
         await callback.answer("Не удалось отклонить (статус изменился).", show_alert=True)
         return
+    # Temporary debug log for details keys
+    logging.debug(f"reject_payment details keys: {list(details.keys())}")
     # Mark as rejected and free slot
     await database.update_booking_status(booking_id, config.STATUS_REJECTED)
-    await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (details["slot_id"],))
-    await database.db.commit()
+    slot_id = details["slot_id"] if "slot_id" in details.keys() else None
+    if not slot_id:
+        # Попробуем найти слот по дате и времени, если slot_id не передан
+        cur = await database.db.execute(
+            "SELECT id FROM slots WHERE date=? AND time=?",
+            (details["date"], details["time"])
+        )
+        row = await cur.fetchone()
+        slot_id = row["id"] if row else None
+    if slot_id:
+        await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (slot_id,))
+        await database.db.commit()
+    else:
+        logging.error(f"reject_payment: slot_id not found in details for booking {booking_id}")
+        await callback.answer("Ошибка: слот не найден для этой записи.", show_alert=True)
+        return
     user_id = details["user_id"]
     date = details["date"]; time = details["time"]
     date_disp = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
