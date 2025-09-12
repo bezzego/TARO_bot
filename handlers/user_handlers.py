@@ -189,14 +189,17 @@ async def receive_phone(message: Message, state: FSMContext):
         await state.clear()
         return
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    date_kb = InlineKeyboardMarkup()
+
+    date_buttons = []
     for date_str in free_dates:
         try:
-            dt = datetime.strptime(date_str, "%Y-%m-%Y")
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
+            display = dt.strftime("%d.%m.%Y")
         except:
-            dt = None
-        display = dt.strftime("%d.%m.%Y") if dt else date_str
-        date_kb.add(InlineKeyboardButton(text=display, callback_data=f"date|{date_str}"))
+            display = date_str
+        date_buttons.append([InlineKeyboardButton(text=display, callback_data=f"date|{date_str}")])
+
+    date_kb = InlineKeyboardMarkup(inline_keyboard=date_buttons)
     await message.answer("Выберите дату:", reply_markup=date_kb)
     await state.set_state(BookingState.select_date)
 
@@ -215,14 +218,15 @@ async def select_date_callback(callback: CallbackQuery, state: FSMContext):
         free_dates = await database.get_free_dates()
         if free_dates:
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            date_kb = InlineKeyboardMarkup()
+            date_buttons = []
             for date_str in free_dates:
                 try:
                     dt = datetime.strptime(date_str, "%Y-%m-%d")
                     display = dt.strftime("%d.%m.%Y")
                 except:
                     display = date_str
-                date_kb.add(InlineKeyboardButton(text=display, callback_data=f"date|{date_str}"))
+                date_buttons.append([InlineKeyboardButton(text=display, callback_data=f"date|{date_str}")])
+            date_kb = InlineKeyboardMarkup(inline_keyboard=date_buttons)
             try:
                 await callback.message.edit_text("Выберите дату:", reply_markup=date_kb)
             except:
@@ -235,9 +239,11 @@ async def select_date_callback(callback: CallbackQuery, state: FSMContext):
         return
     # List available times for selected date
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    time_kb = InlineKeyboardMarkup()
-    for slot_id, time in free_times:
-        time_kb.add(InlineKeyboardButton(text=time, callback_data=f"time|{slot_id}"))
+    time_buttons = [
+        [InlineKeyboardButton(text=time, callback_data=f"time|{slot_id}")]
+        for slot_id, time in free_times
+    ]
+    time_kb = InlineKeyboardMarkup(inline_keyboard=time_buttons)
     try:
         await callback.message.edit_text(f"Дата {datetime.strptime(selected_date, '%Y-%m-%d').strftime('%d.%m.%Y')} выбрана. Выберите время:", reply_markup=time_kb)
     except:
@@ -272,9 +278,11 @@ async def select_time_callback(callback: CallbackQuery, state: FSMContext):
         free_times = await database.get_free_times(fsm_data.get("selected_date"))
         if free_times:
             from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            time_kb = InlineKeyboardMarkup()
-            for sid, t in free_times:
-                time_kb.add(InlineKeyboardButton(text=t, callback_data=f"time|{sid}"))
+            time_buttons = [
+                [InlineKeyboardButton(text=t, callback_data=f"time|{sid}")]
+                for sid, t in free_times
+            ]
+            time_kb = InlineKeyboardMarkup(inline_keyboard=time_buttons)
             try:
                 await callback.message.edit_text("Выберите время:", reply_markup=time_kb)
             except:
@@ -286,14 +294,15 @@ async def select_time_callback(callback: CallbackQuery, state: FSMContext):
             free_dates = await database.get_free_dates()
             if free_dates:
                 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                date_kb = InlineKeyboardMarkup()
+                date_buttons = []
                 for date_str in free_dates:
                     try:
                         dt = datetime.strptime(date_str, "%Y-%m-%d")
                         display = dt.strftime("%d.%m.%Y")
                     except:
                         display = date_str
-                    date_kb.add(InlineKeyboardButton(text=display, callback_data=f"date|{date_str}"))
+                    date_buttons.append([InlineKeyboardButton(text=display, callback_data=f"date|{date_str}")])
+                date_kb = InlineKeyboardMarkup(inline_keyboard=date_buttons)
                 await callback.message.edit_text("Выберите дату:", reply_markup=date_kb)
                 await state.set_state(BookingState.select_date)
             else:
@@ -383,17 +392,49 @@ async def receive_receipt(message: Message, state: FSMContext):
         # Send participants' photos to admin group
         try:
             if participant_photos:
-                media_group = [InputMediaPhoto(pid) for pid in participant_photos]
-                media_group[0].caption = f"Фото участников (запись #{booking_id})"
-                await config.bot.send_media_group(config.ADMIN_GROUP_ID, media_group)
+                media_group = []
+                for idx, pid in enumerate(participant_photos):
+                    if idx == 0:
+                        media_group.append(InputMediaPhoto(media=pid, caption=f"Фото участников (запись #{booking_id})"))
+                    else:
+                        media_group.append(InputMediaPhoto(media=pid))
+                await config.bot.send_media_group(chat_id=config.ADMIN_GROUP_ID, media=media_group)
         except Exception as e:
-            logging.error(f"Failed to send participant photos to admin group: {e}")
+            # Handle possible supergroup migration: extract new chat id and retry once
+            err_text = str(e)
+            logging.error(f"Failed to send participant photos to admin group: {err_text}")
+            m = re.search(r"-100\d+", err_text)
+            if m:
+                try:
+                    new_id = int(m.group())
+                    config.ADMIN_GROUP_ID = new_id
+                    logging.info(f"Detected admin group migration. Updating ADMIN_GROUP_ID to {new_id} and retrying media group send.")
+                    if participant_photos:
+                        media_group = []
+                        for idx, pid in enumerate(participant_photos):
+                            if idx == 0:
+                                media_group.append(InputMediaPhoto(media=pid, caption=f"Фото участников (запись #{booking_id})"))
+                            else:
+                                media_group.append(InputMediaPhoto(media=pid))
+                        await config.bot.send_media_group(chat_id=config.ADMIN_GROUP_ID, media=media_group)
+                except Exception as e2:
+                    logging.error(f"Retry after migration failed: {e2}")
         # Send payment receipt photo
         try:
             receipt_file_id = message.photo[-1].file_id
-            await config.bot.send_photo(config.ADMIN_GROUP_ID, receipt_file_id, caption=f"Чек от @{username or user_name}")
+            await config.bot.send_photo(chat_id=config.ADMIN_GROUP_ID, photo=receipt_file_id, caption=f"Чек от @{username or user_name}")
         except Exception as e:
-            logging.error(f"Failed to send receipt photo to admin group: {e}")
+            err_text = str(e)
+            logging.error(f"Failed to send receipt photo to admin group: {err_text}")
+            m = re.search(r"-100\d+", err_text)
+            if m:
+                try:
+                    new_id = int(m.group())
+                    config.ADMIN_GROUP_ID = new_id
+                    logging.info(f"Detected admin group migration. Updating ADMIN_GROUP_ID to {new_id} and retrying receipt send.")
+                    await config.bot.send_photo(chat_id=config.ADMIN_GROUP_ID, photo=receipt_file_id, caption=f"Чек от @{username or user_name}")
+                except Exception as e2:
+                    logging.error(f"Retry after migration (receipt) failed: {e2}")
         # Send booking details text with inline confirm/reject buttons
         details_text = (
             f"Запись #{booking_id}\n"
@@ -415,10 +456,21 @@ async def receive_receipt(message: Message, state: FSMContext):
             ]
         ])
         try:
-            sent_msg = await config.bot.send_message(config.ADMIN_GROUP_ID, details_text, reply_markup=admin_kb)
+            sent_msg = await config.bot.send_message(chat_id=config.ADMIN_GROUP_ID, text=details_text, reply_markup=admin_kb)
             await database.set_booking_admin_message_id(booking_id, sent_msg.message_id)
         except Exception as e:
-            logging.error(f"Failed to send booking details to admin group: {e}")
+            err_text = str(e)
+            logging.error(f"Failed to send booking details to admin group: {err_text}")
+            m = re.search(r"-100\d+", err_text)
+            if m:
+                try:
+                    new_id = int(m.group())
+                    config.ADMIN_GROUP_ID = new_id
+                    logging.info(f"Detected admin group migration. Updating ADMIN_GROUP_ID to {new_id} and retrying details send.")
+                    sent_msg = await config.bot.send_message(chat_id=config.ADMIN_GROUP_ID, text=details_text, reply_markup=admin_kb)
+                    await database.set_booking_admin_message_id(booking_id, sent_msg.message_id)
+                except Exception as e2:
+                    logging.error(f"Retry after migration (details) failed: {e2}")
     # Acknowledge user
     await message.answer("Чек получен. Ожидайте подтверждения администрации.", reply_markup=keyboards.main_menu_kb)
     await state.clear()
@@ -433,7 +485,7 @@ async def list_bookings(message: Message):
     else:
         text_lines = ["Ваши записи:"]
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        cancel_kb = InlineKeyboardMarkup()
+        buttons = []
         for rec in records:
             status = rec["status"]
             date = rec["date"]
@@ -449,7 +501,8 @@ async def list_bookings(message: Message):
                 status_text = status
             date_display = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
             text_lines.append(f"- {date_display} {time} — {status_text}")
-            cancel_kb.add(InlineKeyboardButton(text=f"Отменить {date_display} {time}", callback_data=f"cancel|{rec['id']}"))
+            buttons.append([InlineKeyboardButton(text=f"Отменить {date_display} {time}", callback_data=f"cancel|{rec['id']}")])
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
         await message.answer("\n".join(text_lines), reply_markup=cancel_kb)
 
 # Handle inline cancel button for a specific booking
