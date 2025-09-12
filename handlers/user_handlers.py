@@ -62,10 +62,15 @@ async def start_command(message: Message, state: FSMContext):
     user = message.from_user
     # Register or update user in database
     await database.get_or_create_user(user.id, user.username, user.full_name)
-    # Greeting message with conditions
+    # Greeting message with current price fetched from DB
+    try:
+        price = await database.get_price()
+    except Exception:
+        # Fallback if DB call fails
+        price = 350
     welcome_text = (
-        "Привет! Я бот для записи на расклад. Условия:\n"
-        "1 вопрос = 350 ₽.\n"
+        f"Привет! Я бот для записи на расклад. Условия:\n"
+        f"1 вопрос = {price} ₽.\n"
         "Для расклада необходимо предоставить историю ситуации, имена всех участников, фото участников, список вопросов и телефон для связи.\n"
         "Запись и оплата проводятся только через этого бота."
     )
