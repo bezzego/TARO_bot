@@ -10,6 +10,7 @@ from aiogram.fsm.context import FSMContext
 import config
 import database
 import keyboards
+import bot_texts
 from states import BookingState
 
 router = Router()
@@ -66,25 +67,13 @@ async def start_command(message: Message, state: FSMContext):
     try:
         price = await database.get_price()
     except Exception:
-        # Fallback if DB call fails
         price = 350
-    welcome_text = (
-        f"Привет! Я бот для записи на расклад. Условия:\n"
-        f"1 вопрос = {price} ₽.\n"
-        "Для расклада необходимо предоставить историю ситуации, имена всех участников, фото участников, список вопросов и телефон для связи.\n"
-        "Запись и оплата проводятся только через этого бота."
-    )
-    await message.answer(welcome_text, reply_markup=keyboards.main_menu_kb)
+    await message.answer(bot_texts.welcome_text(price), reply_markup=keyboards.main_menu_kb, parse_mode="HTML")
 
 # Help menu
 @router.message(F.text == "ℹ Помощь")
 async def help_command(message: Message):
-    help_text = (
-        "Чтобы записаться на расклад, нажмите «📅 Записаться» и следуйте инструкциям.\n"
-        "В разделе «📋 Мои записи» можно просмотреть ваши записи и их статус, а при необходимости отменить запись.\n"
-        "Оплата происходит переводом на указанные реквизиты, после чего нужно отправить фото чека для подтверждения."
-    )
-    await message.answer(help_text, reply_markup=keyboards.main_menu_kb)
+    await message.answer(bot_texts.help_text(), reply_markup=keyboards.main_menu_kb, parse_mode="HTML")
 
 # Begin booking process when user selects "📅 Записаться"
 @router.message(F.text == "📅 Записаться")
@@ -156,7 +145,7 @@ async def receive_questions(message: Message, state: FSMContext):
     price = await database.get_price()
     amount = num_questions * price
     await state.update_data(questions=questions_text, num_questions=num_questions, amount=amount)
-    await message.answer(f"Вопросов: {num_questions}. Сумма к оплате: {amount} ₽.")
+    await message.answer(bot_texts.price_summary(num_questions, amount), parse_mode="HTML")
     # Request phone number
     await message.answer("Теперь отправьте свой номер телефона для связи.", reply_markup=keyboards.contact_kb)
     await state.set_state(BookingState.phone)
@@ -332,13 +321,7 @@ async def select_time_callback(callback: CallbackQuery, state: FSMContext):
     else:
         date_disp = fsm_data.get('selected_date')
         time_str = ""
-    pay_text = (f"Слот {date_disp} {time_str} зарезервирован на 15 минут.\n"
-                f"Оплатите {amount} ₽ по реквизитам:\n"
-                "Сбербанк: 2202 2061 5913 1163 (Сергей Александрович С.)\n"
-                "Тинькофф: 2200 7017 1423 6749 (Арианна С.)\n"
-                "В комментарии к переводу укажите имя отправителя и последние 4 цифры карты.\n"
-                "После оплаты отправьте фото чека.")
-    await callback.message.answer(pay_text)
+    await callback.message.answer(bot_texts.payment_instructions(amount, date_disp, time_str), parse_mode="HTML")
     await state.set_state(BookingState.waiting_receipt)
     # Schedule auto-unlock job in 15 minutes
     from scheduler import scheduler, unlock_timeout
