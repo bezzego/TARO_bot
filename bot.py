@@ -2,6 +2,7 @@ import asyncio
 import logging
 
 from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
 
 import config
 from handlers import user_handlers, admin_handlers
@@ -16,7 +17,10 @@ async def main():
         handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()]
     )
     # Initialize bot and dispatcher
-    bot = Bot(token=config.BOT_TOKEN, parse_mode="HTML")
+    bot = Bot(
+        token=config.BOT_TOKEN,
+        default=DefaultBotProperties(parse_mode="HTML")
+    )
     dp = Dispatcher()
     # Set global bot instance for use in other modules
     config.bot = bot
