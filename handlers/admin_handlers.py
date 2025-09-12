@@ -1,8 +1,11 @@
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Router
+from aiogram import F
 from aiogram.types import Message, CallbackQuery
+import admin_keyboard as keyboards
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 
 import config
@@ -10,6 +13,174 @@ import database
 from states import AdminState
 
 router = Router()
+
+# Admin main menu handler
+@router.message(F.text == "/admin")
+async def admin_menu_cmd(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("Админ-панель:", reply_markup=keyboards.admin_main_ilkb)
+
+# Callback handler to return to admin main menu
+@router.callback_query(F.data == "admin|menu")
+async def admin_menu_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer()
+        return
+    await callback.message.edit_text("Админ-панель:")
+    await callback.message.edit_reply_markup(reply_markup=keyboards.admin_main_ilkb)
+    await callback.answer()
+
+# ---- Admin inline panel callbacks ----
+
+def _dates_for_page(offset_weeks: int):
+    """Return list of 7 ISO dates starting today + offset_weeks*7."""
+    start = datetime.now() + timedelta(days=offset_weeks * 7)
+    return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+@router.callback_query(F.data.startswith("admin|schedule|"))
+async def admin_schedule_open(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    try:
+        offset = int(callback.data.split("|")[2])
+    except Exception:
+        offset = 0
+    dates = _dates_for_page(offset)
+    dates_kb = keyboards.build_dates_ilkb(dates)
+    nav_kb = keyboards.build_nav_row_for_dates(offset)
+    combined = InlineKeyboardMarkup(inline_keyboard=dates_kb.inline_keyboard + nav_kb.inline_keyboard)
+    await callback.message.edit_text("Выберите дату для управления слотами:")
+    await callback.message.edit_reply_markup(reply_markup=combined)
+    await callback.answer()
+
+
+# Helper function to show the date screen (extracted from admin_pick_date)
+async def show_date_screen(callback: CallbackQuery, date_iso: str):
+    cur = await database.db.execute("SELECT time, is_taken FROM slots WHERE date=? ORDER BY time", (date_iso,))
+    rows = await cur.fetchall()
+    times = [(r["time"], r["is_taken"]) for r in rows]
+
+    manage_kb = keyboards.build_times_manage_ilkb(date_iso, times)
+
+    base_times = ["13:00","14:00","15:00","16:00","17:00","18:00"]
+    existing = {t for t, _ in times}
+    to_add = [t for t in base_times if t not in existing]
+    add_row_kb = keyboards.build_add_times_row(date_iso, to_add) if to_add else None
+
+    inline_keyboard = manage_kb.inline_keyboard[:]
+    if add_row_kb:
+        inline_keyboard += add_row_kb.inline_keyboard
+    inline_keyboard += [[InlineKeyboardButton(text="⬅️ К датам", callback_data="admin|schedule|0")]]
+    inline_keyboard += keyboards.admin_back_menu_ilkb().inline_keyboard
+    final_kb = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+
+    human_date = datetime.strptime(date_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
+    lines = [f"Дата: <b>{human_date}</b>", "Текущие слоты:"]
+    if times:
+        for t, taken in times:
+            lines.append(f"• {t} — {'занято' if taken else 'свободно'}")
+    else:
+        lines.append("• (пока пусто)")
+    lines += ["", "Нажмите «➕ HH:MM» чтобы добавить слот, или «❌ Удалить HH:MM» чтобы убрать свободный слот."]
+
+    await callback.message.edit_text("\n".join(lines))
+    await callback.message.edit_reply_markup(reply_markup=final_kb)
+
+
+@router.callback_query(F.data.startswith("sched_date|"))
+async def admin_pick_date(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    date_iso = callback.data.split("|", 1)[1]
+    await show_date_screen(callback, date_iso)
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("addslot|"))
+async def admin_addslot_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    _, date_iso, time_str = callback.data.split("|", 2)
+    ok = await database.add_slot(date_iso, time_str)
+    await callback.answer("Добавлено" if ok else "Уже существует", show_alert=False)
+    await show_date_screen(callback, date_iso)
+
+@router.callback_query(F.data.startswith("delslot|"))
+async def admin_delslot_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    _, date_iso, time_str = callback.data.split("|", 2)
+    res = await database.remove_slot(date_iso, time_str)
+    msg = "Удалено" if res == 1 else ("Нельзя удалить занятый" if res == -1 else "Не найден")
+    await callback.answer(msg, show_alert=(res == -1))
+    await show_date_screen(callback, date_iso)
+
+@router.callback_query(F.data == "admin|price")
+async def admin_price_menu(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    current = await database.get_price()
+    await callback.message.edit_text(f"Текущая стоимость вопроса: <b>{current} ₽</b>")
+    await callback.message.edit_reply_markup(reply_markup=keyboards.build_price_menu_ilkb(current))
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("price|"))
+async def admin_price_change(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    _, action, step_str = callback.data.split("|", 2)
+    try:
+        step = int(step_str)
+    except Exception:
+        step = 50
+    current = await database.get_price()
+    new_price = current + step if action == "inc" else max(0, current - step)
+    await database.db.execute("UPDATE settings SET value=? WHERE key='price_per_question'", (str(new_price),))
+    await database.db.commit()
+    await callback.message.edit_text(f"Текущая стоимость вопроса: <b>{new_price} ₽</b>")
+    await callback.message.edit_reply_markup(reply_markup=keyboards.build_price_menu_ilkb(new_price))
+    await callback.answer("Цена обновлена")
+
+@router.callback_query(F.data == "admin|bookings")
+async def admin_bookings_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    records = await database.get_all_bookings()
+    if not records:
+        text = "Записей не найдено."
+    else:
+        lines = ["Список записей:"]
+        for rec in records:
+            date_disp = datetime.strptime(rec["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+            status = rec["status"]
+            if status == config.STATUS_WAITING_PAYMENT:
+                st = "Ожидает оплаты"
+            elif status == config.STATUS_CHECKING:
+                st = "На подтверждении"
+            elif status == config.STATUS_CONFIRMED:
+                st = "Подтверждена"
+            elif status == config.STATUS_REJECTED:
+                st = "Отклонена"
+            elif status == config.STATUS_CANCELLED:
+                st = "Отменена"
+            else:
+                st = status
+            lines.append(f"- {date_disp} {rec['time']} — {rec['user_name'] or ''} (@{rec['username'] or ''}) — {st}")
+        text = "\n".join(lines)
+    await callback.message.edit_text(text)
+    await callback.message.edit_reply_markup(reply_markup=keyboards.admin_back_menu_ilkb())
+    await callback.answer()
+
+@router.callback_query(F.data == "admin|unlock")
+async def admin_unlock_hint(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    hint = ("Разблокировка слота: используйте команду\n"
+            "<code>/unlockslot ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
+            "Позже можно добавить здесь выбор даты/времени.")
+    await callback.message.edit_text(hint)
+    await callback.message.edit_reply_markup(reply_markup=keyboards.admin_back_menu_ilkb())
+    await callback.answer()
 
 # Helper to check if a user is admin
 def is_admin(user_id: int) -> bool:
