@@ -440,16 +440,16 @@ async def receive_receipt(message: Message, state: FSMContext):
                     logging.error(f"Retry after migration (receipt) failed: {e2}")
         # Send booking details text with inline confirm/reject buttons
         details_text = (
-            f"Запись #{booking_id}\n"
-            f"Клиент: {user_name} (@{username})\n"
-            f"Телефон: {phone}\n"
-            f"История: {story}\n"
-            f"Участники: {participants}\n"
-            f"Вопросов: {num_q}\n"
-            f"Вопросы: {questions}\n"
-            f"Дата и время: {datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m.%Y')} {time}\n"
-            f"Сумма: {amount} ₽\n"
-            f"Статус: Ожидает подтверждения оплаты"
+            f"📌 <b>Запись #{booking_id}</b>\n\n"
+            f"👤 <b>Клиент:</b> {user_name} (@{username})\n"
+            f"📞 <b>Телефон:</b> {phone}\n\n"
+            f"📖 <b>История:</b>\n{story}\n\n"
+            f"👥 <b>Участники:</b>\n{participants}\n\n"
+            f"❓ <b>Количество вопросов:</b> {num_q}\n"
+            f"💬 <b>Вопросы:</b>\n{questions}\n\n"
+            f"📅 <b>Дата:</b> {datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m.%Y')}  ⏰ <b>Время:</b> {time}\n"
+            f"💵 <b>Сумма:</b> {amount} ₽\n"
+            f"⏳ <b>Статус:</b> Ожидает подтверждения оплаты"
         )
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
         admin_kb = InlineKeyboardMarkup(inline_keyboard=[
