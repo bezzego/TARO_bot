@@ -63,7 +63,14 @@ async def show_date_screen(callback: CallbackQuery, date_iso: str):
 
     manage_kb = keyboards.build_times_manage_ilkb(date_iso, times)
 
-    base_times = ["13:00","14:00","15:00","16:00","17:00","18:00"]
+    # Создаем 15 временных слотов каждые 20 минут с 13:00 до 18:00 (включительно)
+    base_times = []
+    start_hour = 13
+    end_hour = 18
+    minutes_step = 20
+    for h in range(start_hour, end_hour + 1):
+        for m in range(0, 60, minutes_step):
+            base_times.append(f"{h:02d}:{m:02d}")
     existing = {t for t, _ in times}
     to_add = [t for t in base_times if t not in existing]
     add_row_kb = keyboards.build_add_times_row(date_iso, to_add) if to_add else None
