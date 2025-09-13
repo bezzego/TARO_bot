@@ -322,7 +322,8 @@ async def select_time_callback(callback: CallbackQuery, state: FSMContext):
         date_disp = fsm_data.get('selected_date')
         time_str = ""
     await callback.message.answer(bot_texts.payment_instructions(amount, date_disp, time_str), parse_mode="HTML")
-    await state.set_state(BookingState.waiting_receipt)
+    await callback.message.answer("УКАЖИТЕ ОТ КОГО ПЕРЕВОД и номер карты, на которую был сделан перевод (например: От Анны Гавриловны К., карта: (номер карты)).")
+    await state.set_state(BookingState.payment_info)
     # Schedule auto-unlock job in 15 minutes
     from scheduler import scheduler, unlock_timeout
     run_time = datetime.now() + timedelta(minutes=15)
@@ -331,6 +332,16 @@ async def select_time_callback(callback: CallbackQuery, state: FSMContext):
     except Exception as e:
         logging.error(f"Failed to schedule unlock job: {e}")
     await callback.answer()
+
+# State: waiting for payment info
+@router.message(BookingState.payment_info)
+async def receive_payment_info(message: Message, state: FSMContext):
+    if not message.text or message.text.strip() == "":
+        await message.answer("Пожалуйста, укажите от кого перевод и на какую карту.")
+        return
+    await state.update_data(payment_info=message.text.strip())
+    await message.answer("Теперь отправьте фотографию чека об оплате.")
+    await state.set_state(BookingState.waiting_receipt)
 
 # State: waiting for payment receipt photo
 @router.message(BookingState.waiting_receipt)
@@ -410,7 +421,9 @@ async def receive_receipt(message: Message, state: FSMContext):
         # Send payment receipt photo
         try:
             receipt_file_id = message.photo[-1].file_id
-            await config.bot.send_photo(chat_id=config.ADMIN_GROUP_ID, photo=receipt_file_id, caption=f"Чек от @{username or user_name}")
+            payment_info = data.get("payment_info", "")
+            caption = f"Чек от @{username or user_name}\n{payment_info}" if payment_info else f"Чек от @{username or user_name}"
+            await config.bot.send_photo(chat_id=config.ADMIN_GROUP_ID, photo=receipt_file_id, caption=caption)
         except Exception as e:
             err_text = str(e)
             logging.error(f"Failed to send receipt photo to admin group: {err_text}")
@@ -420,7 +433,9 @@ async def receive_receipt(message: Message, state: FSMContext):
                     new_id = int(m.group())
                     config.ADMIN_GROUP_ID = new_id
                     logging.info(f"Detected admin group migration. Updating ADMIN_GROUP_ID to {new_id} and retrying receipt send.")
-                    await config.bot.send_photo(chat_id=config.ADMIN_GROUP_ID, photo=receipt_file_id, caption=f"Чек от @{username or user_name}")
+                    payment_info = data.get("payment_info", "")
+                    caption = f"Чек от @{username or user_name}\n{payment_info}" if payment_info else f"Чек от @{username or user_name}"
+                    await config.bot.send_photo(chat_id=config.ADMIN_GROUP_ID, photo=receipt_file_id, caption=caption)
                 except Exception as e2:
                     logging.error(f"Retry after migration (receipt) failed: {e2}")
         # Send booking details text with inline confirm/reject buttons
