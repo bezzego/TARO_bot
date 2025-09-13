@@ -9,6 +9,8 @@ class BookingState(StatesGroup):
     select_date = State()
     select_time = State()
     waiting_receipt = State()
+    payment_info = State()
+
 
 class AdminState(StatesGroup):
     adding_slot = State()
