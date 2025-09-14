@@ -459,7 +459,12 @@ async def receive_receipt(message: Message, state: FSMContext):
             ]
         ])
         try:
-            sent_msg = await config.bot.send_message(chat_id=config.ADMIN_GROUP_ID, text=details_text, reply_markup=admin_kb)
+            sent_msg = await config.bot.send_message(
+                chat_id=config.ADMIN_GROUP_ID,
+                text=details_text,
+                reply_markup=admin_kb,
+                parse_mode="HTML"
+            )
             await database.set_booking_admin_message_id(booking_id, sent_msg.message_id)
         except Exception as e:
             err_text = str(e)
@@ -470,7 +475,12 @@ async def receive_receipt(message: Message, state: FSMContext):
                     new_id = int(m.group())
                     config.ADMIN_GROUP_ID = new_id
                     logging.info(f"Detected admin group migration. Updating ADMIN_GROUP_ID to {new_id} and retrying details send.")
-                    sent_msg = await config.bot.send_message(chat_id=config.ADMIN_GROUP_ID, text=details_text, reply_markup=admin_kb)
+                    sent_msg = await config.bot.send_message(
+                        chat_id=config.ADMIN_GROUP_ID,
+                        text=details_text,
+                        reply_markup=admin_kb,
+                        parse_mode="HTML"
+                    )
                     await database.set_booking_admin_message_id(booking_id, sent_msg.message_id)
                 except Exception as e2:
                     logging.error(f"Retry after migration (details) failed: {e2}")
