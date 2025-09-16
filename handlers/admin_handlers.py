@@ -148,34 +148,56 @@ async def admin_price_change(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=keyboards.build_price_menu_ilkb(new_price))
     await callback.answer("Цена обновлена")
 
-@router.callback_query(F.data == "admin|bookings")
+@router.callback_query(F.data.startswith("admin|bookings"))
 async def admin_bookings_cb(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer(); return
+    # Разбираем страницу из callback.data, по умолчанию 0
+    parts = callback.data.split("|")
+    page = int(parts[2]) if len(parts) > 2 else 0
+    page_size = 20
     records = await database.get_all_bookings()
     if not records:
         text = "Записей не найдено."
-    else:
-        lines = ["Список записей:"]
-        for rec in records:
-            date_disp = datetime.strptime(rec["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
-            status = rec["status"]
-            if status == config.STATUS_WAITING_PAYMENT:
-                st = "Ожидает оплаты"
-            elif status == config.STATUS_CHECKING:
-                st = "На подтверждении"
-            elif status == config.STATUS_CONFIRMED:
-                st = "Подтверждена"
-            elif status == config.STATUS_REJECTED:
-                st = "Отклонена"
-            elif status == config.STATUS_CANCELLED:
-                st = "Отменена"
-            else:
-                st = status
-            lines.append(f"- {date_disp} {rec['time']} — {rec['user_name'] or ''} (@{rec['username'] or ''}) — {st}")
-        text = "\n".join(lines)
+        await callback.message.edit_text(text)
+        await callback.message.edit_reply_markup(reply_markup=keyboards.admin_back_menu_ilkb())
+        await callback.answer()
+        return
+    total_pages = (len(records) + page_size - 1) // page_size
+    start = page * page_size
+    end = start + page_size
+    slice_records = records[start:end]
+    lines = [f"Список записей (стр. {page+1}/{total_pages}):"]
+    for rec in slice_records:
+        date_disp = datetime.strptime(rec["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+        status = rec["status"]
+        if status == config.STATUS_WAITING_PAYMENT:
+            st = "Ожидает оплаты"
+        elif status == config.STATUS_CHECKING:
+            st = "На подтверждении"
+        elif status == config.STATUS_CONFIRMED:
+            st = "Подтверждена"
+        elif status == config.STATUS_REJECTED:
+            st = "Отклонена"
+        elif status == config.STATUS_CANCELLED:
+            st = "Отменена"
+        else:
+            st = status
+        lines.append(f"- {date_disp} {rec['time']} — {rec['user_name'] or ''} (@{rec['username'] or ''}) — {st}")
+    text = "\n".join(lines)
+    # Кнопки навигации
+    buttons = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin|bookings|{page-1}"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton(text="➡️ Далее", callback_data=f"admin|bookings|{page+1}"))
+    nav_kb = InlineKeyboardMarkup(inline_keyboard=[buttons] if buttons else [])
+    # Добавляем кнопку назад в меню администратора
+    final_kb = InlineKeyboardMarkup(
+        inline_keyboard=nav_kb.inline_keyboard + keyboards.admin_back_menu_ilkb().inline_keyboard
+    )
     await callback.message.edit_text(text)
-    await callback.message.edit_reply_markup(reply_markup=keyboards.admin_back_menu_ilkb())
+    await callback.message.edit_reply_markup(reply_markup=final_kb)
     await callback.answer()
 
 @router.callback_query(F.data == "admin|unlock")
