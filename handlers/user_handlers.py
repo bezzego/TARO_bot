@@ -23,19 +23,21 @@ async def cancel_command(message: Message, state: FSMContext):
         await message.answer("Нет активного процесса для отмены.", reply_markup=keyboards.main_menu_kb)
     else:
         data = await state.get_data()
+        cancelled = False
         # If a booking was already created and waiting (e.g., slot reserved)
         if data.get("booking_id"):
             booking_id = data["booking_id"]
             record = await database.get_booking_by_id(booking_id)
             if record:
                 status = record["status"]
-                if status in (config.STATUS_WAITING_PAYMENT, config.STATUS_CHECKING, config.STATUS_CONFIRMED):
+                if status in (config.STATUS_WAITING_PAYMENT, config.STATUS_CHECKING):
                     # Cancel booking in DB and free slot
                     slot_id = record["slot_id"]
                     await database.update_booking_status(booking_id, config.STATUS_CANCELLED)
                     await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (slot_id,))
                     await database.db.commit()
                     logging.info(f"Booking {booking_id} cancelled by user via /cancel")
+                    cancelled = True
                     # Notify admin group if a payment was pending or booking confirmed
                     admin_msg_id = record["admin_message_id"]
                     if admin_msg_id:
@@ -55,7 +57,10 @@ async def cancel_command(message: Message, state: FSMContext):
                         except Exception as e:
                             logging.error(f"Failed to notify admin of cancellation: {e}")
         await state.clear()
-        await message.answer("Запись отменена.", reply_markup=keyboards.main_menu_kb)
+        if cancelled:
+            await message.answer("Запись отменена.", reply_markup=keyboards.main_menu_kb)
+        else:
+            await message.answer("Процесс отменен. Возвращаемся в главное меню.", reply_markup=keyboards.main_menu_kb)
 
 # Start command /start - greeting and main menu
 @router.message(F.text == "/start")
@@ -503,6 +508,7 @@ async def list_bookings(message: Message):
             status = rec["status"]
             date = rec["date"]
             time = rec["time"]
+            cancel_allowed = status in (config.STATUS_WAITING_PAYMENT, config.STATUS_CHECKING)
             # Map status to Russian text
             if status == config.STATUS_WAITING_PAYMENT:
                 status_text = "Ожидает оплаты"
@@ -510,12 +516,15 @@ async def list_bookings(message: Message):
                 status_text = "На подтверждении"
             elif status == config.STATUS_CONFIRMED:
                 status_text = "Подтверждена"
+                if not cancel_allowed:
+                    status_text += " (отменить можно через администратора)"
             else:
                 status_text = status
             date_display = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
             text_lines.append(f"- {date_display} {time} — {status_text}")
-            buttons.append([InlineKeyboardButton(text=f"Отменить {date_display} {time}", callback_data=f"cancel|{rec['id']}")])
-        cancel_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+            if cancel_allowed:
+                buttons.append([InlineKeyboardButton(text=f"Отменить {date_display} {time}", callback_data=f"cancel|{rec['id']}")])
+        cancel_kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
         await message.answer("\n".join(text_lines), reply_markup=cancel_kb)
 
 # Handle inline cancel button for a specific booking
@@ -531,7 +540,10 @@ async def cancel_booking_callback(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Ошибка или запись не найдена.", show_alert=True)
         return
     status = record["status"]
-    if status in (config.STATUS_WAITING_PAYMENT, config.STATUS_CHECKING, config.STATUS_CONFIRMED):
+    if status == config.STATUS_CONFIRMED:
+        await callback.answer("Подтвержденную запись может отменить только администратор.", show_alert=True)
+        return
+    if status in (config.STATUS_WAITING_PAYMENT, config.STATUS_CHECKING):
         await database.update_booking_status(booking_id, config.STATUS_CANCELLED)
         await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (record["slot_id"],))
         await database.db.commit()
