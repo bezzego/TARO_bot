@@ -1,7 +1,8 @@
 import json
-import aiosqlite
 import logging
 from datetime import datetime
+
+import aiosqlite
 
 import config
 
@@ -46,6 +47,8 @@ async def init_db():
                 amount        INTEGER,
                 status        TEXT,
                 admin_message_id INTEGER,
+                slot_date_cache TEXT,
+                slot_time_cache TEXT,
                 FOREIGN KEY(user_id) REFERENCES users(user_id),
                 FOREIGN KEY(slot_id) REFERENCES slots(id)
             )""")
@@ -61,6 +64,33 @@ async def init_db():
         default_price = 350  # default price per question
         await db.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", ("price_per_question", str(default_price)))
         logging.info(f"Default price_per_question set to {default_price}")
+    await db.commit()
+
+    # Ensure cache columns exist in bookings table for historical slot data
+    for column in ("slot_date_cache", "slot_time_cache"):
+        try:
+            await db.execute(f"ALTER TABLE bookings ADD COLUMN {column} TEXT")
+            logging.info(f"Added missing column {column} to bookings table")
+        except aiosqlite.OperationalError as e:
+            if "duplicate column name" not in str(e).lower():
+                raise
+    # Populate cache columns for existing rows when missing
+    await db.execute(
+        """UPDATE bookings
+           SET slot_date_cache = (
+               SELECT date FROM slots WHERE slots.id = bookings.slot_id
+           )
+           WHERE slot_id IS NOT NULL AND (slot_date_cache IS NULL OR slot_date_cache = '')
+        """
+    )
+    await db.execute(
+        """UPDATE bookings
+           SET slot_time_cache = (
+               SELECT time FROM slots WHERE slots.id = bookings.slot_id
+           )
+           WHERE slot_id IS NOT NULL AND (slot_time_cache IS NULL OR slot_time_cache = '')
+        """
+    )
     await db.commit()
 
 async def get_price():
@@ -101,18 +131,27 @@ async def add_slot(date: str, time: str):
 
 async def remove_slot(date: str, time: str):
     """Remove a slot by date and time if it is free.
-    Return 1 if removed, 0 if not found, -1 if taken, -2 if there is booking history."""
+    Return 1 if removed, 0 if not found, -1 if there are active bookings."""
     cur = await db.execute("SELECT id, is_taken FROM slots WHERE date=? AND time=?", (date, time))
     row = await cur.fetchone()
     if row is None:
         return 0  # not found
     slot_id = row["id"]
-    if row["is_taken"] != 0:
-        return -1  # slot is taken (cannot remove)
-    # Prevent deletion if any bookings reference this slot (even cancelled ones)
-    cur = await db.execute("SELECT 1 FROM bookings WHERE slot_id=? LIMIT 1", (slot_id,))
-    if await cur.fetchone():
-        return -2
+    # Check if there are bookings referencing this slot
+    cur_books = await db.execute("SELECT id, status FROM bookings WHERE slot_id=?", (slot_id,))
+    bookings = await cur_books.fetchall()
+    active_statuses = {
+        config.STATUS_CREATED,
+        config.STATUS_WAITING_PAYMENT,
+        config.STATUS_CHECKING,
+        config.STATUS_CONFIRMED
+    }
+    has_active = any(rec["status"] in active_statuses for rec in bookings)
+    if row["is_taken"] != 0 or has_active:
+        return -1  # slot is taken or has active booking (cannot remove)
+    if bookings:
+        # Detach cancelled/rejected bookings from the slot but keep cached date/time
+        await db.execute("UPDATE bookings SET slot_id=NULL WHERE slot_id=?", (slot_id,))
     await db.execute("DELETE FROM slots WHERE id=?", (slot_id,))
     await db.commit()
     logging.info(f"Removed slot {date} {time}")
@@ -122,15 +161,20 @@ async def reserve_slot_and_create_booking(user_id: int, slot_id: int, story: str
     """Reserve a slot (if available) and create a booking entry. Returns booking_id or None if slot already taken."""
     try:
         await db.execute("BEGIN")
+        slot_cur = await db.execute("SELECT date, time FROM slots WHERE id=?", (slot_id,))
+        slot_row = await slot_cur.fetchone()
+        if slot_row is None:
+            await db.execute("ROLLBACK")
+            return None
         cur = await db.execute("UPDATE slots SET is_taken=1 WHERE id=? AND is_taken=0", (slot_id,))
         if cur.rowcount == 0:
             await db.execute("ROLLBACK")
             return None
         photos_json = json.dumps(photo_ids) if photo_ids is not None else json.dumps([])
         await db.execute(
-            "INSERT INTO bookings (user_id, slot_id, story, participants, photos, questions, num_questions, amount, status, admin_message_id) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, slot_id, story, participants, photos_json, questions, num_questions, amount, config.STATUS_WAITING_PAYMENT, None)
+            "INSERT INTO bookings (user_id, slot_id, story, participants, photos, questions, num_questions, amount, status, admin_message_id, slot_date_cache, slot_time_cache) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, slot_id, story, participants, photos_json, questions, num_questions, amount, config.STATUS_WAITING_PAYMENT, None, slot_row["date"], slot_row["time"])
         )
         # Get last inserted booking id
         cur2 = await db.execute("SELECT last_insert_rowid()")
@@ -169,10 +213,12 @@ async def get_booking_details(booking_id: int):
     """Get detailed booking info joined with user and slot."""
     query = """SELECT b.id, b.status, b.num_questions, b.amount, b.story, b.participants, b.questions, b.photos, b.admin_message_id,
                       u.name as user_name, u.username as username, u.phone as phone,
-                      s.date as date, s.time as time, b.user_id
+                      COALESCE(s.date, b.slot_date_cache) as date,
+                      COALESCE(s.time, b.slot_time_cache) as time,
+                      b.user_id
                FROM bookings b 
                JOIN users u ON b.user_id = u.user_id
-               JOIN slots s ON b.slot_id = s.id
+               LEFT JOIN slots s ON b.slot_id = s.id
                WHERE b.id = ?"""
     cur = await db.execute(query, (booking_id,))
     return await cur.fetchone()
@@ -205,10 +251,12 @@ async def get_all_slots():
 
 async def get_all_bookings():
     """Get all bookings joined with user info."""
-    query = """SELECT s.date, s.time, b.status, u.name as user_name, u.username as username
+    query = """SELECT COALESCE(s.date, b.slot_date_cache) AS date,
+                      COALESCE(s.time, b.slot_time_cache) AS time,
+                      b.status, u.name as user_name, u.username as username
                FROM bookings b 
                JOIN users u ON b.user_id = u.user_id
-               JOIN slots s ON b.slot_id = s.id
-               ORDER BY s.date, s.time"""
+               LEFT JOIN slots s ON b.slot_id = s.id
+               ORDER BY COALESCE(s.date, b.slot_date_cache), COALESCE(s.time, b.slot_time_cache)"""
     cur = await db.execute(query)
     return await cur.fetchall()

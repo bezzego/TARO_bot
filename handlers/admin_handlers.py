@@ -122,10 +122,7 @@ async def admin_delslot_cb(callback: CallbackQuery):
         msg = "Удалено"
         alert = False
     elif res == -1:
-        msg = "Нельзя удалить занятый слот"
-        alert = True
-    elif res == -2:
-        msg = "Нельзя удалить: есть записи по этому времени"
+        msg = "Нельзя удалить слот: есть активные записи или он занят"
         alert = True
     elif res == 0:
         msg = "Слот не найден"
@@ -183,7 +180,16 @@ async def admin_bookings_cb(callback: CallbackQuery):
     slice_records = records[start:end]
     lines = [f"Список записей (стр. {page+1}/{total_pages}):"]
     for rec in slice_records:
-        date_disp = datetime.strptime(rec["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+        date_raw = rec["date"]
+        time_raw = rec["time"]
+        if date_raw:
+            try:
+                date_disp = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d.%m.%Y")
+            except ValueError:
+                date_disp = date_raw
+        else:
+            date_disp = "Дата не указана"
+        time_disp = time_raw if time_raw else "Время не указано"
         status = rec["status"]
         if status == config.STATUS_WAITING_PAYMENT:
             st = "Ожидает оплаты"
@@ -197,7 +203,7 @@ async def admin_bookings_cb(callback: CallbackQuery):
             st = "Отменена"
         else:
             st = status
-        lines.append(f"- {date_disp} {rec['time']} — {rec['user_name'] or ''} (@{rec['username'] or ''}) — {st}")
+        lines.append(f"- {date_disp} {time_disp} — {rec['user_name'] or ''} (@{rec['username'] or ''}) — {st}")
     text = "\n".join(lines)
     # Кнопки навигации
     buttons = []
@@ -328,9 +334,7 @@ async def delslot_command(message: Message, state: FSMContext):
         elif result == 0:
             await message.answer("Слот не найден.")
         elif result == -1:
-            await message.answer("Нельзя удалить занятый слот (уже есть запись).")
-        elif result == -2:
-            await message.answer("Нельзя удалить слот: есть записи в истории по этому времени.")
+            await message.answer("Нельзя удалить слот: он занят или есть активные записи.")
         else:
             await message.answer("Ошибка при удалении слота.")
 
@@ -356,9 +360,7 @@ async def deleting_slot_state(message: Message, state: FSMContext):
     elif result == 0:
         await message.answer("Слот не найден или уже удалён.")
     elif result == -1:
-        await message.answer("Этот слот занят и не может быть удалён.")
-    elif result == -2:
-        await message.answer("Этот слот связан с записями в истории и не может быть удалён.")
+        await message.answer("Этот слот занят или по нему есть активные записи, удалить нельзя.")
     else:
         await message.answer("Ошибка при удалении слота.")
     await state.clear()
@@ -394,12 +396,19 @@ async def bookings_command(message: Message):
     else:
         text_lines = ["Список записей:"]
         for rec in records:
-            date = rec["date"]
-            time = rec["time"]
+            date_raw = rec["date"]
+            time_raw = rec["time"]
             status = rec["status"]
             name = rec["user_name"] or "<имя>"
             username = rec["username"] or ""
-            date_display = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
+            if date_raw:
+                try:
+                    date_display = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d.%m.%Y")
+                except ValueError:
+                    date_display = date_raw
+            else:
+                date_display = "Дата не указана"
+            time_display = time_raw if time_raw else "Время не указано"
             if status == config.STATUS_WAITING_PAYMENT:
                 status_text = "Ожидает оплаты"
             elif status == config.STATUS_CHECKING:
@@ -412,7 +421,7 @@ async def bookings_command(message: Message):
                 status_text = "Отменена"
             else:
                 status_text = status
-            text_lines.append(f"- {date_display} {time} — {name} (@{username}) — {status_text}")
+            text_lines.append(f"- {date_display} {time_display} — {name} (@{username}) — {status_text}")
         await message.answer("\n".join(text_lines))
 
 # Admin: unlock a slot manually (cancel booking if needed)
