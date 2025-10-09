@@ -100,7 +100,8 @@ async def add_slot(date: str, time: str):
         return False
 
 async def remove_slot(date: str, time: str):
-    """Remove a slot by date and time if it is free. Return 1 if removed, 0 if not found, -1 if taken."""
+    """Remove a slot by date and time if it is free.
+    Return 1 if removed, 0 if not found, -1 if taken, -2 if there is booking history."""
     cur = await db.execute("SELECT id, is_taken FROM slots WHERE date=? AND time=?", (date, time))
     row = await cur.fetchone()
     if row is None:
@@ -108,6 +109,10 @@ async def remove_slot(date: str, time: str):
     slot_id = row["id"]
     if row["is_taken"] != 0:
         return -1  # slot is taken (cannot remove)
+    # Prevent deletion if any bookings reference this slot (even cancelled ones)
+    cur = await db.execute("SELECT 1 FROM bookings WHERE slot_id=? LIMIT 1", (slot_id,))
+    if await cur.fetchone():
+        return -2
     await db.execute("DELETE FROM slots WHERE id=?", (slot_id,))
     await db.commit()
     logging.info(f"Removed slot {date} {time}")

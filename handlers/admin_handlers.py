@@ -118,8 +118,22 @@ async def admin_delslot_cb(callback: CallbackQuery):
         await callback.answer(); return
     _, date_iso, time_str = callback.data.split("|", 2)
     res = await database.remove_slot(date_iso, time_str)
-    msg = "Удалено" if res == 1 else ("Нельзя удалить занятый" if res == -1 else "Не найден")
-    await callback.answer(msg, show_alert=(res == -1))
+    if res == 1:
+        msg = "Удалено"
+        alert = False
+    elif res == -1:
+        msg = "Нельзя удалить занятый слот"
+        alert = True
+    elif res == -2:
+        msg = "Нельзя удалить: есть записи по этому времени"
+        alert = True
+    elif res == 0:
+        msg = "Слот не найден"
+        alert = False
+    else:
+        msg = "Не удалось удалить слот"
+        alert = True
+    await callback.answer(msg, show_alert=alert)
     await show_date_screen(callback, date_iso)
 
 @router.callback_query(F.data == "admin|price")
@@ -315,6 +329,8 @@ async def delslot_command(message: Message, state: FSMContext):
             await message.answer("Слот не найден.")
         elif result == -1:
             await message.answer("Нельзя удалить занятый слот (уже есть запись).")
+        elif result == -2:
+            await message.answer("Нельзя удалить слот: есть записи в истории по этому времени.")
         else:
             await message.answer("Ошибка при удалении слота.")
 
@@ -341,6 +357,8 @@ async def deleting_slot_state(message: Message, state: FSMContext):
         await message.answer("Слот не найден или уже удалён.")
     elif result == -1:
         await message.answer("Этот слот занят и не может быть удалён.")
+    elif result == -2:
+        await message.answer("Этот слот связан с записями в истории и не может быть удалён.")
     else:
         await message.answer("Ошибка при удалении слота.")
     await state.clear()
