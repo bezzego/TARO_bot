@@ -11,7 +11,8 @@ import config
 import database
 import keyboards
 import bot_texts
-from states import BookingState
+import spreads_data
+from states import BookingState, ChooseQuestionState
 
 router = Router()
 
@@ -80,6 +81,190 @@ async def start_command(message: Message, state: FSMContext):
 async def help_command(message: Message):
     await message.answer(bot_texts.help_text(), reply_markup=keyboards.main_menu_kb, parse_mode="HTML")
 
+
+# --- Выбрать вопрос / готовый расклад ---
+@router.message(F.text == "📋 Выбрать вопрос / расклад")
+async def choose_question_or_spread(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "Вы можете <b>выбрать вопросы из списка</b> (собрать свой расклад) или выбрать <b>готовый расклад</b> с фиксированными вопросами и ценой.",
+        reply_markup=keyboards.kb_choose_type(),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "spread_type|questions")
+@router.callback_query(F.data == "spread_type|ready")
+async def spread_type_callback(callback: CallbackQuery, state: FSMContext):
+    if callback.data == "spread_type|questions":
+        await callback.message.edit_text(
+            "Выберите категорию вопросов. Затем вам будет показан нумерованный список — напишите номера нужных вопросов через запятую (например: 1, 5, 10).\n\n"
+            f"Стоимость одного вопроса из списка — <b>{spreads_data.QUESTION_PRICE}₽</b>.",
+            reply_markup=keyboards.kb_question_categories(),
+            parse_mode="HTML"
+        )
+    else:
+        await callback.message.edit_text(
+            "Выберите категорию готовых раскладов:",
+            reply_markup=keyboards.kb_ready_category()
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ready_cat|"))
+async def ready_category_callback(callback: CallbackQuery, state: FSMContext):
+    cat = callback.data.split("|", 1)[1]
+    spreads = spreads_data.get_ready_spreads_by_category(cat)
+    if not spreads:
+        await callback.answer("Нет раскладов в этой категории.", show_alert=True)
+        return
+    label = "Отношения" if cat == "relations" else "Общие"
+    await callback.message.edit_text(
+        f"Готовые расклады — <b>{label}</b>. Выберите расклад:",
+        reply_markup=keyboards.kb_ready_spreads(spreads),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("ready|"))
+async def show_ready_spread_callback(callback: CallbackQuery, state: FSMContext):
+    spread_id = callback.data.split("|", 1)[1]
+    spread = spreads_data.get_ready_spread_by_id(spread_id)
+    if not spread:
+        await callback.answer("Расклад не найден.", show_alert=True)
+        return
+    text = spreads_data.format_ready_spread_text(spread)
+    await callback.message.edit_text(
+        text,
+        reply_markup=keyboards.kb_after_ready_spread(spread_id)
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("book_ready|"))
+async def book_with_ready_spread_callback(callback: CallbackQuery, state: FSMContext):
+    spread_id = callback.data.split("|", 1)[1]
+    spread = spreads_data.get_ready_spread_by_id(spread_id)
+    if not spread:
+        await callback.answer("Расклад не найден.", show_alert=True)
+        return
+    questions_text = "\n".join(spread["questions"])
+    await state.clear()
+    await state.set_state(BookingState.story)
+    await state.update_data(
+        prefilled_questions=questions_text,
+        prefilled_num_questions=len(spread["questions"]),
+        prefilled_amount=spread["price"],
+    )
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"Вы выбрали расклад «{spread['name']}» ({spread['price']}₽).\n\n"
+        "Пожалуйста, опишите вашу ситуацию (краткая история).",
+        reply_markup=keyboards.main_menu_kb
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("qcat|"))
+async def question_category_callback(callback: CallbackQuery, state: FSMContext):
+    cat_id = callback.data.split("|", 1)[1]
+    questions = spreads_data.get_category_questions(cat_id)
+    title = spreads_data.get_category_title(cat_id)
+    if not questions:
+        await callback.answer("Категория не найдена.", show_alert=True)
+        return
+    lines = [f"{title}", "", "Напишите номера нужных вопросов через запятую (например: 1, 5, 10):", ""]
+    for i, q in enumerate(questions, 1):
+        lines.append(f"{i}. {q}")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = "\n".join(lines[:3] + [f"{i}. {q}" for i, q in enumerate(questions[:50], 1)])
+        text += "\n\n... (показаны первые 50). Напишите номера через запятую."
+    await state.set_state(ChooseQuestionState.enter_numbers)
+    await state.update_data(question_category_id=cat_id, question_list=questions)
+    try:
+        await callback.message.edit_text(text)
+    except Exception:
+        await callback.message.answer(text)
+    await callback.answer()
+
+
+@router.message(ChooseQuestionState.enter_numbers, F.text)
+async def receive_question_numbers(message: Message, state: FSMContext):
+    data = await state.get_data()
+    questions = data.get("question_list", [])
+    if not questions:
+        await message.answer("Ошибка: список вопросов не найден. Начните заново из меню «Выбрать вопрос / расклад».", reply_markup=keyboards.main_menu_kb)
+        await state.clear()
+        return
+    raw = message.text.strip().replace(" ", "")
+    parts = re.split(r"[,;\s]+", raw)
+    indices = []
+    for p in parts:
+        if not p:
+            continue
+        try:
+            n = int(p)
+            if 1 <= n <= len(questions):
+                indices.append(n)
+        except ValueError:
+            pass
+    indices = sorted(set(indices))
+    if not indices:
+        await message.answer(
+            f"Не удалось разобрать номера. Введите числа от 1 до {len(questions)} через запятую (например: 1, 5, 10)."
+        )
+        return
+    selected = [questions[i - 1] for i in indices]
+    amount = len(selected) * spreads_data.QUESTION_PRICE
+    await state.update_data(
+        selected_questions="\n".join(selected),
+        selected_num_questions=len(selected),
+        selected_amount=amount,
+    )
+    summary = (
+        f"Выбрано вопросов: <b>{len(selected)}</b>. Сумма: <b>{amount}₽</b>.\n\n"
+        "Нажмите кнопку ниже, чтобы записаться с этими вопросами (далее: ситуация, участники, фото, контакт, дата и время)."
+    )
+    await message.answer(
+        summary,
+        reply_markup=keyboards.kb_after_question_selection(len(selected), amount),
+        parse_mode="HTML"
+    )
+
+
+@router.callback_query(F.data == "book_custom")
+async def book_with_custom_questions_callback(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    questions_text = data.get("selected_questions")
+    num = data.get("selected_num_questions", 0)
+    amount = data.get("selected_amount", 0)
+    if not questions_text or num <= 0:
+        await callback.answer("Сначала выберите вопросы (напишите номера через запятую).", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(BookingState.story)
+    await state.update_data(
+        prefilled_questions=questions_text,
+        prefilled_num_questions=num,
+        prefilled_amount=amount,
+    )
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"Вы выбрали {num} вопросов ({amount}₽).\n\n"
+        "Пожалуйста, опишите вашу ситуацию (краткая история).",
+        reply_markup=keyboards.main_menu_kb
+    )
+    await callback.answer()
+
+
 # Begin booking process when user selects "📅 Записаться"
 @router.message(F.text == "📅 Записаться")
 async def book_appointment(message: Message, state: FSMContext):
@@ -127,7 +312,17 @@ async def receive_photos(message: Message, state: FSMContext):
         if not photos:
             await message.answer("Вы не отправили ни одной фотографии. Пожалуйста, отправьте хотя бы одно фото участника.")
             return
-        # Proceed to next step: ask for questions
+        # Если вопросы уже выбраны (готовый расклад или список) — переходим сразу к сумме и телефону
+        prefilled = data.get("prefilled_questions")
+        if prefilled:
+            num_questions = data.get("prefilled_num_questions", 0)
+            amount = data.get("prefilled_amount", 0)
+            await state.update_data(questions=prefilled, num_questions=num_questions, amount=amount)
+            await message.answer(bot_texts.price_summary(num_questions, amount), parse_mode="HTML")
+            await message.answer("Теперь отправьте свой номер телефона для связи.", reply_markup=keyboards.contact_kb)
+            await state.set_state(BookingState.phone)
+            return
+        # Иначе запрашиваем вопросы вручную
         await message.answer("Теперь отправьте список ваших вопросов (каждый вопрос с новой строки).", reply_markup=None)
         await state.set_state(BookingState.questions)
     else:

@@ -12,6 +12,11 @@ class BookingState(StatesGroup):
     payment_info = State()
 
 
+class ChooseQuestionState(StatesGroup):
+    """Выбор вопросов из списка по категории (номера через запятую)."""
+    enter_numbers = State()
+
+
 class AdminState(StatesGroup):
     adding_slot = State()
     deleting_slot = State()
