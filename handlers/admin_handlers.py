@@ -1,10 +1,13 @@
 import logging
+from html import escape
 from datetime import datetime, timedelta
 
 from aiogram import Router
 from aiogram import F
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import Message, CallbackQuery
 import admin_keyboard as keyboards
+import keyboards as keyboards_user
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 
@@ -12,31 +15,125 @@ import config
 import database
 from states import AdminState
 
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo("Europe/Moscow")
+except Exception:
+    _TZ = None
+
 router = Router()
 
-# Admin main menu handler
-@router.message(F.text == "/admin")
-async def admin_menu_cmd(message: Message):
+STATUS_TEXT = {
+    config.STATUS_WAITING_PAYMENT: "💳 ждёт оплаты",
+    config.STATUS_CHECKING: "⏳ проверка оплаты",
+    config.STATUS_CONFIRMED: "✅ подтверждена",
+    config.STATUS_REJECTED: "❌ отклонена",
+    config.STATUS_CANCELLED: "🚫 отменена",
+}
+ACTIVE_STATUSES = (config.STATUS_WAITING_PAYMENT, config.STATUS_CHECKING, config.STATUS_CONFIRMED)
+BOOKINGS_PAGE_SIZE = 10
+
+
+def _now():
+    return datetime.now(_TZ) if _TZ else datetime.now()
+
+
+def _today_iso():
+    return _now().strftime("%Y-%m-%d")
+
+
+def _fmt_date(date_iso, weekday=True):
+    try:
+        d = datetime.strptime(date_iso, "%Y-%m-%d")
+    except Exception:
+        return date_iso or "дата не указана"
+    s = d.strftime("%d.%m")
+    return f"{keyboards.WEEKDAYS_SHORT[d.weekday()]} {s}" if weekday else s
+
+
+def _client(name, username):
+    parts = [escape(name or "без имени")]
+    if username:
+        parts.append(f"@{escape(username)}")
+    return " ".join(parts)
+
+
+async def _show(callback: CallbackQuery, text: str, kb: InlineKeyboardMarkup):
+    """Редактирует сообщение панели одним запросом; игнорирует «не изменилось»."""
+    try:
+        await callback.message.edit_text(text, reply_markup=kb)
+    except TelegramBadRequest as e:
+        if "message is not modified" not in str(e):
+            raise
+
+
+# ---- Главное меню ----
+
+async def _main_menu_payload():
+    price = await database.get_price()
+    today = _today_iso()
+    cur = await database.db.execute(
+        "SELECT status, COUNT(*) AS n FROM bookings "
+        "WHERE status IN (?, ?) GROUP BY status",
+        (config.STATUS_CHECKING, config.STATUS_WAITING_PAYMENT))
+    by_status = {r["status"]: r["n"] for r in await cur.fetchall()}
+    checking = by_status.get(config.STATUS_CHECKING, 0)
+    waiting = by_status.get(config.STATUS_WAITING_PAYMENT, 0)
+    cur = await database.db.execute(
+        "SELECT COUNT(*) AS n FROM bookings b LEFT JOIN slots s ON b.slot_id=s.id "
+        "WHERE b.status=? AND COALESCE(s.date, b.slot_date_cache) >= ?",
+        (config.STATUS_CONFIRMED, today))
+    confirmed = (await cur.fetchone())["n"]
+    cur = await database.db.execute(
+        "SELECT COUNT(*) AS n FROM slots WHERE is_taken=0 AND date >= ?", (today,))
+    free = (await cur.fetchone())["n"]
+
+    lines = ["🔮 <b>Админ-панель</b>", ""]
+    if checking:
+        lines.append(f"⏳ Ждут вашего подтверждения: <b>{checking}</b>")
+    else:
+        lines.append("✨ Новых оплат на проверку нет")
+    if waiting:
+        lines.append(f"💳 Ждут оплаты: {waiting}")
+    lines += [
+        f"✅ Подтверждено (впереди): {confirmed}",
+        f"🟢 Свободных слотов: {free}",
+        f"💰 Цена вопроса: {price} ₽",
+    ]
+    return "\n".join(lines), keyboards.build_admin_main_ilkb(checking, waiting)
+
+
+@router.message(F.text.in_({"/admin", keyboards_user.ADMIN_PANEL_BTN}))
+async def admin_menu_cmd(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    await message.answer("Админ-панель:", reply_markup=keyboards.admin_main_ilkb)
+    await state.clear()
+    text, kb = await _main_menu_payload()
+    await message.answer(text, reply_markup=kb)
 
-# Callback handler to return to admin main menu
+
 @router.callback_query(F.data == "admin|menu")
 async def admin_menu_cb(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer()
         return
-    await callback.message.edit_text("Админ-панель:")
-    await callback.message.edit_reply_markup(reply_markup=keyboards.admin_main_ilkb)
+    text, kb = await _main_menu_payload()
+    await _show(callback, text, kb)
     await callback.answer()
 
-# ---- Admin inline panel callbacks ----
+
+@router.callback_query(F.data == "noop")
+async def noop_cb(callback: CallbackQuery):
+    await callback.answer()
+
+
+# ---- Расписание ----
 
 def _dates_for_page(offset_weeks: int):
     """Return list of 7 ISO dates starting today + offset_weeks*7."""
-    start = datetime.now() + timedelta(days=offset_weeks * 7)
+    start = _now() + timedelta(days=offset_weeks * 7)
     return [(start + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
 
 @router.callback_query(F.data.startswith("admin|schedule|"))
 async def admin_schedule_open(callback: CallbackQuery):
@@ -47,52 +144,64 @@ async def admin_schedule_open(callback: CallbackQuery):
     except Exception:
         offset = 0
     dates = _dates_for_page(offset)
-    dates_kb = keyboards.build_dates_ilkb(dates)
+    cur = await database.db.execute(
+        "SELECT date, COUNT(*) AS total, SUM(CASE WHEN is_taken=0 THEN 1 ELSE 0 END) AS free "
+        "FROM slots WHERE date BETWEEN ? AND ? GROUP BY date", (dates[0], dates[-1]))
+    stats = {r["date"]: (r["free"] or 0, r["total"]) for r in await cur.fetchall()}
+    date_stats = [(d, *stats.get(d, (0, 0))) for d in dates]
+    dates_kb = keyboards.build_dates_ilkb(date_stats)
     nav_kb = keyboards.build_nav_row_for_dates(offset)
     combined = InlineKeyboardMarkup(inline_keyboard=dates_kb.inline_keyboard + nav_kb.inline_keyboard)
-    await callback.message.edit_text("Выберите дату для управления слотами:")
-    await callback.message.edit_reply_markup(reply_markup=combined)
+    text = (f"📆 <b>Расписание</b>: {_fmt_date(dates[0], False)} — {_fmt_date(dates[-1], False)}\n\n"
+            "Выберите день.\n"
+            "🟢 N — свободных слотов · 🔴 всё занято · ⚪ слотов нет")
+    await _show(callback, text, combined)
     await callback.answer()
 
 
-# Helper function to show the date screen (extracted from admin_pick_date)
+def _base_times():
+    # 15 слотов каждые 20 минут с 13:00 до 18:40
+    return [f"{h:02d}:{m:02d}" for h in range(13, 19) for m in range(0, 60, 20)]
+
+
 async def show_date_screen(callback: CallbackQuery, date_iso: str):
-    cur = await database.db.execute("SELECT time, is_taken FROM slots WHERE date=? ORDER BY time", (date_iso,))
+    cur = await database.db.execute(
+        "SELECT s.time, s.is_taken, u.name AS name, u.username AS username "
+        "FROM slots s "
+        "LEFT JOIN bookings b ON b.slot_id = s.id AND b.status NOT IN (?, ?) "
+        "LEFT JOIN users u ON u.user_id = b.user_id "
+        "WHERE s.date=? ORDER BY s.time",
+        (config.STATUS_CANCELLED, config.STATUS_REJECTED, date_iso))
     rows = await cur.fetchall()
-    times = [(r["time"], r["is_taken"]) for r in rows]
+    existing = {r["time"]: r for r in rows}
 
-    manage_kb = keyboards.build_times_manage_ilkb(date_iso, times)
+    all_times = sorted(set(_base_times()) | set(existing))
+    cells = []
+    for t in all_times:
+        r = existing.get(t)
+        cells.append((t, "absent" if r is None else ("taken" if r["is_taken"] else "free")))
+    can_add_all = any(s == "absent" for _, s in cells)
 
-    # Создаем 15 временных слотов каждые 20 минут с 13:00 до 18:00 (включительно)
-    base_times = []
-    start_hour = 13
-    end_hour = 18
-    minutes_step = 20
-    for h in range(start_hour, end_hour + 1):
-        for m in range(0, 60, minutes_step):
-            base_times.append(f"{h:02d}:{m:02d}")
-    existing = {t for t, _ in times}
-    to_add = [t for t in base_times if t not in existing]
-    add_row_kb = keyboards.build_add_times_row(date_iso, to_add) if to_add else None
+    try:
+        d = datetime.strptime(date_iso, "%Y-%m-%d")
+        title = f"{keyboards.WEEKDAYS_FULL[d.weekday()]}, {d.strftime('%d.%m.%Y')}"
+        back_offset = max(0, (d.date() - _now().date()).days // 7)
+    except Exception:
+        title, back_offset = date_iso, 0
 
-    inline_keyboard = manage_kb.inline_keyboard[:]
-    if add_row_kb:
-        inline_keyboard += add_row_kb.inline_keyboard
-    inline_keyboard += [[InlineKeyboardButton(text="⬅️ К датам", callback_data="admin|schedule|0")]]
-    inline_keyboard += keyboards.admin_back_menu_ilkb().inline_keyboard
-    final_kb = InlineKeyboardMarkup(inline_keyboard=inline_keyboard)
+    free_n = sum(1 for _, s in cells if s == "free")
+    lines = [f"📅 <b>{title}</b>", f"Свободно: {free_n} · занято: {sum(1 for _, s in cells if s == 'taken')}", ""]
+    taken = [r for r in rows if r["is_taken"]]
+    if taken:
+        lines.append("<b>Записаны:</b>")
+        for r in taken:
+            who = _client(r["name"], r["username"]) if r["name"] else "—"
+            lines.append(f"🔒 {r['time']} — {who}")
+        lines.append("")
+    lines.append("🟢 свободный — нажмите, чтобы убрать\n➕ нет в расписании — нажмите, чтобы добавить\n🔒 занят")
 
-    human_date = datetime.strptime(date_iso, "%Y-%m-%d").strftime("%d.%m.%Y")
-    lines = [f"Дата: <b>{human_date}</b>", "Текущие слоты:"]
-    if times:
-        for t, taken in times:
-            lines.append(f"• {t} — {'занято' if taken else 'свободно'}")
-    else:
-        lines.append("• (пока пусто)")
-    lines += ["", "Нажмите «➕ HH:MM» чтобы добавить слот, или «❌ Удалить HH:MM» чтобы убрать свободный слот."]
-
-    await callback.message.edit_text("\n".join(lines))
-    await callback.message.edit_reply_markup(reply_markup=final_kb)
+    await _show(callback, "\n".join(lines),
+                keyboards.build_day_ilkb(date_iso, cells, can_add_all, back_offset))
 
 
 @router.callback_query(F.data.startswith("sched_date|"))
@@ -103,6 +212,7 @@ async def admin_pick_date(callback: CallbackQuery):
     await show_date_screen(callback, date_iso)
     await callback.answer()
 
+
 @router.callback_query(F.data.startswith("addslot|"))
 async def admin_addslot_cb(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -112,6 +222,20 @@ async def admin_addslot_cb(callback: CallbackQuery):
     await callback.answer("Добавлено" if ok else "Уже существует", show_alert=False)
     await show_date_screen(callback, date_iso)
 
+
+@router.callback_query(F.data.startswith("addall|"))
+async def admin_addall_cb(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    date_iso = callback.data.split("|", 1)[1]
+    added = 0
+    for t in _base_times():
+        if await database.add_slot(date_iso, t):
+            added += 1
+    await callback.answer(f"Добавлено слотов: {added}")
+    await show_date_screen(callback, date_iso)
+
+
 @router.callback_query(F.data.startswith("delslot|"))
 async def admin_delslot_cb(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
@@ -119,28 +243,32 @@ async def admin_delslot_cb(callback: CallbackQuery):
     _, date_iso, time_str = callback.data.split("|", 2)
     res = await database.remove_slot(date_iso, time_str)
     if res == 1:
-        msg = "Удалено"
-        alert = False
+        msg, alert = "Удалено", False
     elif res == -1:
-        msg = "Нельзя удалить слот: есть активные записи или он занят"
-        alert = True
+        msg, alert = "Нельзя удалить слот: есть активные записи или он занят", True
     elif res == 0:
-        msg = "Слот не найден"
-        alert = False
+        msg, alert = "Слот не найден", False
     else:
-        msg = "Не удалось удалить слот"
-        alert = True
+        msg, alert = "Не удалось удалить слот", True
     await callback.answer(msg, show_alert=alert)
     await show_date_screen(callback, date_iso)
+
+
+# ---- Цена ----
+
+def _price_text(price):
+    return (f"💰 <b>Стоимость вопроса</b>\n\nСейчас: <b>{price} ₽</b>\n\n"
+            "Изменить шаг кнопками ниже или командой <code>/price 500</code>.")
+
 
 @router.callback_query(F.data == "admin|price")
 async def admin_price_menu(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer(); return
     current = await database.get_price()
-    await callback.message.edit_text(f"Текущая стоимость вопроса: <b>{current} ₽</b>")
-    await callback.message.edit_reply_markup(reply_markup=keyboards.build_price_menu_ilkb(current))
+    await _show(callback, _price_text(current), keyboards.build_price_menu_ilkb(current))
     await callback.answer()
+
 
 @router.callback_query(F.data.startswith("price|"))
 async def admin_price_change(callback: CallbackQuery):
@@ -155,81 +283,135 @@ async def admin_price_change(callback: CallbackQuery):
     new_price = current + step if action == "inc" else max(0, current - step)
     await database.db.execute("UPDATE settings SET value=? WHERE key='price_per_question'", (str(new_price),))
     await database.db.commit()
-    await callback.message.edit_text(f"Текущая стоимость вопроса: <b>{new_price} ₽</b>")
-    await callback.message.edit_reply_markup(reply_markup=keyboards.build_price_menu_ilkb(new_price))
-    await callback.answer("Цена обновлена")
+    await _show(callback, _price_text(new_price), keyboards.build_price_menu_ilkb(new_price))
+    await callback.answer(f"Цена: {new_price} ₽")
+
+
+# ---- Записи ----
+
+async def _load_bookings():
+    cur = await database.db.execute(
+        "SELECT COALESCE(s.date, b.slot_date_cache) AS date, "
+        "COALESCE(s.time, b.slot_time_cache) AS time, "
+        "b.status, u.name AS user_name, u.username AS username "
+        "FROM bookings b JOIN users u ON b.user_id = u.user_id "
+        "LEFT JOIN slots s ON b.slot_id = s.id "
+        "ORDER BY COALESCE(s.date, b.slot_date_cache), COALESCE(s.time, b.slot_time_cache)")
+    return await cur.fetchall()
+
 
 @router.callback_query(F.data.startswith("admin|bookings"))
 async def admin_bookings_cb(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer(); return
-    # Разбираем страницу из callback.data, по умолчанию 0
     parts = callback.data.split("|")
-    page = int(parts[2]) if len(parts) > 2 else 0
-    page_size = 20
-    records = await database.get_all_bookings()
-    if not records:
-        text = "Записей не найдено."
-        await callback.message.edit_text(text)
-        await callback.message.edit_reply_markup(reply_markup=keyboards.admin_back_menu_ilkb())
-        await callback.answer()
-        return
-    total_pages = (len(records) + page_size - 1) // page_size
-    start = page * page_size
-    end = start + page_size
-    slice_records = records[start:end]
-    lines = [f"Список записей (стр. {page+1}/{total_pages}):"]
-    for rec in slice_records:
-        date_raw = rec["date"]
-        time_raw = rec["time"]
-        if date_raw:
-            try:
-                date_disp = datetime.strptime(date_raw, "%Y-%m-%d").strftime("%d.%m.%Y")
-            except ValueError:
-                date_disp = date_raw
-        else:
-            date_disp = "Дата не указана"
-        time_disp = time_raw if time_raw else "Время не указано"
-        status = rec["status"]
-        if status == config.STATUS_WAITING_PAYMENT:
-            st = "Ожидает оплаты"
-        elif status == config.STATUS_CHECKING:
-            st = "На подтверждении"
-        elif status == config.STATUS_CONFIRMED:
-            st = "Подтверждена"
-        elif status == config.STATUS_REJECTED:
-            st = "Отклонена"
-        elif status == config.STATUS_CANCELLED:
-            st = "Отменена"
-        else:
-            st = status
-        lines.append(f"- {date_disp} {time_disp} — {rec['user_name'] or ''} (@{rec['username'] or ''}) — {st}")
-    text = "\n".join(lines)
-    # Кнопки навигации
-    buttons = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin|bookings|{page-1}"))
-    if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton(text="➡️ Далее", callback_data=f"admin|bookings|{page+1}"))
-    nav_kb = InlineKeyboardMarkup(inline_keyboard=[buttons] if buttons else [])
-    # Добавляем кнопку назад в меню администратора
-    final_kb = InlineKeyboardMarkup(
-        inline_keyboard=nav_kb.inline_keyboard + keyboards.admin_back_menu_ilkb().inline_keyboard
-    )
-    await callback.message.edit_text(text)
-    await callback.message.edit_reply_markup(reply_markup=final_kb)
+    flt = parts[2] if len(parts) > 2 and parts[2] in ("chk", "act", "all") else "act"
+    try:
+        page = int(parts[3]) if len(parts) > 3 else (int(parts[2]) if len(parts) > 2 else 0)
+    except ValueError:
+        page = 0
+
+    today = _today_iso()
+    records = await _load_bookings()
+    sets = {
+        "chk": [r for r in records if r["status"] == config.STATUS_CHECKING],
+        "act": [r for r in records if r["status"] in ACTIVE_STATUSES and (r["date"] or "9999") >= today],
+        "all": list(records),
+    }
+    counts = {k: len(v) for k, v in sets.items()}
+    items = sets[flt]
+    if flt == "all":
+        items = items[::-1]  # свежие сверху
+    total_pages = max(1, (len(items) + BOOKINGS_PAGE_SIZE - 1) // BOOKINGS_PAGE_SIZE)
+    page = min(max(page, 0), total_pages - 1)
+    chunk = items[page * BOOKINGS_PAGE_SIZE:(page + 1) * BOOKINGS_PAGE_SIZE]
+
+    titles = {"chk": "⏳ Ждут проверки оплаты", "act": "📅 Актуальные записи", "all": "🗂 Все записи"}
+    lines = [f"📋 <b>{titles[flt]}</b>", ""]
+    if not chunk:
+        lines.append("Пока пусто ✨")
+    last_date = object()
+    for rec in chunk:
+        if rec["date"] != last_date:
+            last_date = rec["date"]
+            if len(lines) > 2:
+                lines.append("")
+            lines.append(f"<b>{_fmt_date(rec['date'])}</b>" if rec["date"] else "<b>Дата не указана</b>")
+        st = STATUS_TEXT.get(rec["status"], escape(str(rec["status"])))
+        lines.append(f"  {rec['time'] or '--:--'} · {_client(rec['user_name'], rec['username'])}\n      {st}")
+    kb = keyboards.build_bookings_ilkb(flt, page, total_pages, counts)
+    await _show(callback, "\n".join(lines), kb)
     await callback.answer()
 
+
+# ---- Разблокировка слотов ----
+
+class _Collector:
+    """Подменяет Message для handle_unlock: собирает текст ответа."""
+    def __init__(self):
+        self.text = ""
+
+    async def answer(self, text, **kwargs):
+        self.text = text
+
+
+async def _taken_slots():
+    cur = await database.db.execute(
+        "SELECT s.id, s.date, s.time, u.name AS name, u.username AS username "
+        "FROM slots s "
+        "LEFT JOIN bookings b ON b.slot_id = s.id AND b.status NOT IN (?, ?) "
+        "LEFT JOIN users u ON u.user_id = b.user_id "
+        "WHERE s.is_taken=1 AND s.date >= ? ORDER BY s.date, s.time LIMIT 40",
+        (config.STATUS_CANCELLED, config.STATUS_REJECTED, _today_iso()))
+    return await cur.fetchall()
+
+
 @router.callback_query(F.data == "admin|unlock")
-async def admin_unlock_hint(callback: CallbackQuery):
+async def admin_unlock_list(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer(); return
-    hint = ("Разблокировка слота: используйте команду\n"
-            "<code>/unlockslot ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
-            "Позже можно добавить здесь выбор даты/времени.")
-    await callback.message.edit_text(hint)
-    await callback.message.edit_reply_markup(reply_markup=keyboards.admin_back_menu_ilkb())
+    slots = await _taken_slots()
+    if not slots:
+        text = "🔓 <b>Занятых слотов нет</b>\n\nРазблокировать нечего ✨"
+    else:
+        text = ("🔓 <b>Занятые слоты</b>\n\nВыберите слот. Запись клиента будет отменена, "
+                "а слот снова станет свободным.")
+    items = [(r["id"], f"{_fmt_date(r['date'])} {r['time']} · {(r['name'] or 'без записи')[:20]}") for r in slots]
+    await _show(callback, text, keyboards.build_unlock_list_ilkb(items))
     await callback.answer()
+
+
+async def _slot_row(slot_id):
+    cur = await database.db.execute("SELECT id, date, time FROM slots WHERE id=?", (slot_id,))
+    return await cur.fetchone()
+
+
+@router.callback_query(F.data.startswith("unlock|ask|"))
+async def admin_unlock_ask(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    slot = await _slot_row(int(callback.data.split("|")[2]))
+    if not slot:
+        await callback.answer("Слот не найден", show_alert=True)
+        return
+    text = (f"🔓 Разблокировать <b>{_fmt_date(slot['date'])} {slot['time']}</b>?\n\n"
+            "Клиент получит уведомление об отмене записи.")
+    await _show(callback, text, keyboards.build_unlock_confirm_ilkb(slot["id"]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("unlock|do|"))
+async def admin_unlock_do(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    slot = await _slot_row(int(callback.data.split("|")[2]))
+    if not slot:
+        await callback.answer("Слот не найден", show_alert=True)
+        return
+    result = _Collector()
+    await handle_unlock(slot["date"], slot["time"], result)
+    await callback.answer(result.text or "Готово", show_alert=True)
+    await admin_unlock_list(callback)
 
 # Helper to check if a user is admin
 def is_admin(user_id: int) -> bool:

@@ -21,7 +21,7 @@ router = Router()
 async def cancel_command(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state is None:
-        await message.answer("Нет активного процесса для отмены.", reply_markup=keyboards.main_menu_kb)
+        await message.answer("Нет активного процесса для отмены.", reply_markup=keyboards.menu_for(message.from_user.id))
     else:
         data = await state.get_data()
         cancelled = False
@@ -59,9 +59,9 @@ async def cancel_command(message: Message, state: FSMContext):
                             logging.error(f"Failed to notify admin of cancellation: {e}")
         await state.clear()
         if cancelled:
-            await message.answer("Запись отменена.", reply_markup=keyboards.main_menu_kb)
+            await message.answer("Запись отменена.", reply_markup=keyboards.menu_for(message.from_user.id))
         else:
-            await message.answer("Процесс отменен. Возвращаемся в главное меню.", reply_markup=keyboards.main_menu_kb)
+            await message.answer("Процесс отменен. Возвращаемся в главное меню.", reply_markup=keyboards.menu_for(message.from_user.id))
 
 # Start command /start - greeting and main menu
 @router.message(F.text == "/start")
@@ -74,12 +74,12 @@ async def start_command(message: Message, state: FSMContext):
         price = await database.get_price()
     except Exception:
         price = 350
-    await message.answer(bot_texts.welcome_text(price), reply_markup=keyboards.main_menu_kb, parse_mode="HTML")
+    await message.answer(bot_texts.welcome_text(price), reply_markup=keyboards.menu_for(message.from_user.id), parse_mode="HTML")
 
 # Help menu
 @router.message(F.text == "ℹ Помощь")
 async def help_command(message: Message):
-    await message.answer(bot_texts.help_text(), reply_markup=keyboards.main_menu_kb, parse_mode="HTML")
+    await message.answer(bot_texts.help_text(), reply_markup=keyboards.menu_for(message.from_user.id), parse_mode="HTML")
 
 
 # --- Выбрать вопрос / готовый расклад ---
@@ -164,7 +164,7 @@ async def book_with_ready_spread_callback(callback: CallbackQuery, state: FSMCon
     await callback.message.answer(
         f"Вы выбрали расклад «{spread['name']}» ({spread['price']}₽).\n\n"
         "Пожалуйста, опишите вашу ситуацию (краткая история).",
-        reply_markup=keyboards.main_menu_kb
+        reply_markup=keyboards.menu_for(callback.from_user.id)
     )
     await callback.answer()
 
@@ -198,7 +198,7 @@ async def receive_question_numbers(message: Message, state: FSMContext):
     data = await state.get_data()
     questions = data.get("question_list", [])
     if not questions:
-        await message.answer("Ошибка: список вопросов не найден. Начните заново из меню «Выбрать вопрос / расклад».", reply_markup=keyboards.main_menu_kb)
+        await message.answer("Ошибка: список вопросов не найден. Начните заново из меню «Выбрать вопрос / расклад».", reply_markup=keyboards.menu_for(message.from_user.id))
         await state.clear()
         return
     raw = message.text.strip().replace(" ", "")
@@ -260,7 +260,7 @@ async def book_with_custom_questions_callback(callback: CallbackQuery, state: FS
     await callback.message.answer(
         f"Вы выбрали {num} вопросов ({amount}₽).\n\n"
         "Пожалуйста, опишите вашу ситуацию (краткая история).",
-        reply_markup=keyboards.main_menu_kb
+        reply_markup=keyboards.menu_for(callback.from_user.id)
     )
     await callback.answer()
 
@@ -379,7 +379,7 @@ async def receive_phone(message: Message, state: FSMContext):
     # Show available dates
     free_dates = await database.get_free_dates()
     if not free_dates:
-        await message.answer("Извините, сейчас нет доступных дат для записи. Попробуйте позже.", reply_markup=keyboards.main_menu_kb)
+        await message.answer("Извините, сейчас нет доступных дат для записи. Попробуйте позже.", reply_markup=keyboards.menu_for(message.from_user.id))
         await state.clear()
         return
     from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -552,12 +552,12 @@ async def receive_receipt(message: Message, state: FSMContext):
     data = await state.get_data()
     booking_id = data.get("booking_id")
     if not booking_id:
-        await message.answer("Ошибка: нет активной записи.", reply_markup=keyboards.main_menu_kb)
+        await message.answer("Ошибка: нет активной записи.", reply_markup=keyboards.menu_for(message.from_user.id))
         await state.clear()
         return
     record = await database.get_booking_by_id(booking_id)
     if not record or record["status"] != config.STATUS_WAITING_PAYMENT:
-        await message.answer("Время ожидания истекло или запись уже отменена.", reply_markup=keyboards.main_menu_kb)
+        await message.answer("Время ожидания истекло или запись уже отменена.", reply_markup=keyboards.menu_for(message.from_user.id))
         await state.clear()
         return
     # Update status to "CHECKING" (awaiting admin confirmation)
@@ -685,7 +685,7 @@ async def receive_receipt(message: Message, state: FSMContext):
                 except Exception as e2:
                     logging.error(f"Retry after migration (details) failed: {e2}")
     # Acknowledge user
-    await message.answer("Чек получен. Ожидайте подтверждения администрации.", reply_markup=keyboards.main_menu_kb)
+    await message.answer("Чек получен. Ожидайте подтверждения администрации.", reply_markup=keyboards.menu_for(message.from_user.id))
     await state.clear()
 
 # List the user's bookings and provide cancel options
@@ -694,7 +694,7 @@ async def list_bookings(message: Message):
     user_id = message.from_user.id
     records = await database.get_user_bookings(user_id)
     if not records or len(records) == 0:
-        await message.answer("У вас нет активных записей.", reply_markup=keyboards.main_menu_kb)
+        await message.answer("У вас нет активных записей.", reply_markup=keyboards.menu_for(message.from_user.id))
     else:
         text_lines = ["Ваши записи:"]
         from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton

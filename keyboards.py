@@ -1,5 +1,9 @@
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 
+import config
+
+ADMIN_PANEL_BTN = "🔮 Админ-панель"
+
 # Main menu keyboard for client
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
@@ -10,6 +14,17 @@ main_menu_kb = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True
 )
+
+# Меню для админов: то же самое + кнопка админ-панели (клиенты её не видят)
+admin_menu_kb = ReplyKeyboardMarkup(
+    keyboard=main_menu_kb.keyboard + [[KeyboardButton(text=ADMIN_PANEL_BTN)]],
+    resize_keyboard=True
+)
+
+
+def menu_for(user_id: int) -> ReplyKeyboardMarkup:
+    """Главное меню с учётом роли пользователя."""
+    return admin_menu_kb if user_id in config.ADMIN_IDS else main_menu_kb
 
 
 # --- Inline-клавиатуры для «Выбрать вопрос / расклад» ---

@@ -1,65 +1,134 @@
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from datetime import datetime
 
-# Главное меню админа
-admin_main_ilkb = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="📆 Настроить расписание", callback_data="admin|schedule|0")],
-        [InlineKeyboardButton(text="💰 Изменить цену", callback_data="admin|price")],
-        [InlineKeyboardButton(text="📋 Записи", callback_data="admin|bookings")],
-        [InlineKeyboardButton(text="🔓 Разблокировать слот", callback_data="admin|unlock")],
-    ]
-)
+WEEKDAYS_SHORT = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+WEEKDAYS_FULL = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
 
-def build_dates_ilkb(date_list):
-    rows = []
-    for ds in date_list:
-        try:
-            disp = datetime.strptime(ds, "%Y-%m-%d").strftime("%d.%m.%Y")
-        except Exception:
-            disp = ds
-        rows.append([InlineKeyboardButton(text=disp, callback_data=f"sched_date|{ds}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+BTN_MENU = InlineKeyboardButton(text="🏠 В меню", callback_data="admin|menu")
 
-def build_times_manage_ilkb(date_iso, times):
-    rows = []
-    for t, taken in times:
-        if taken:
-            rows.append([InlineKeyboardButton(text=f"🔒 {t}", callback_data="noop")])
-        else:
-            rows.append([InlineKeyboardButton(text=f"❌ Удалить {t}", callback_data=f"delslot|{date_iso}|{t}")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def build_add_times_row(date_iso, candidate_times):
-    buttons = [[InlineKeyboardButton(text=f"➕ {t}", callback_data=f"addslot|{date_iso}|{t}")]
-               for t in candidate_times]
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def _btn(text, data):
+    return InlineKeyboardButton(text=text, callback_data=data)
 
-def build_nav_row_for_dates(page_offset):
-    prev_offset = page_offset - 1
-    next_offset = page_offset + 1
+
+def _grid(buttons, cols):
+    return [buttons[i:i + cols] for i in range(0, len(buttons), cols)]
+
+
+def _badge(text, count):
+    return f"{text} · {count}" if count else text
+
+
+def build_admin_main_ilkb(checking=0, waiting=0):
+    """Главное меню. Счётчики показывают, что требует внимания."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [_btn(_badge("📋 Записи", checking), "admin|bookings|chk|0")],
             [
-                InlineKeyboardButton(text="⬅️ Назад", callback_data="admin|menu"),
-                InlineKeyboardButton(text="◀️ Неделя", callback_data=f"admin|schedule|{prev_offset}"),
-                InlineKeyboardButton(text="Неделя ▶️", callback_data=f"admin|schedule|{next_offset}"),
-            ]
+                _btn("📆 Расписание", "admin|schedule|0"),
+                _btn("🔓 Слоты", "admin|unlock"),
+            ],
+            [
+                _btn("💰 Цена", "admin|price"),
+                _btn("🔄 Обновить", "admin|menu"),
+            ],
         ]
     )
+
+
+def build_dates_ilkb(date_stats):
+    """date_stats: список (date_iso, free, total)."""
+    buttons = []
+    for ds, free, total in date_stats:
+        try:
+            d = datetime.strptime(ds, "%Y-%m-%d")
+            label = f"{WEEKDAYS_SHORT[d.weekday()]} {d.strftime('%d.%m')}"
+        except Exception:
+            label = ds
+        if total == 0:
+            mark = "⚪"
+        elif free == 0:
+            mark = "🔴"
+        else:
+            mark = f"🟢 {free}"
+        buttons.append(_btn(f"{label} · {mark}", f"sched_date|{ds}"))
+    return InlineKeyboardMarkup(inline_keyboard=_grid(buttons, 2))
+
+
+def build_nav_row_for_dates(page_offset):
+    row = [_btn("◀️ Раньше", f"admin|schedule|{page_offset - 1}")]
+    if page_offset != 0:
+        row.append(_btn("Сегодня", "admin|schedule|0"))
+    row.append(_btn("Позже ▶️", f"admin|schedule|{page_offset + 1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[row, [BTN_MENU]])
+
+
+def build_day_ilkb(date_iso, cells, can_add_all, back_offset=0):
+    """cells: список (time, state), state: free | taken | absent."""
+    buttons = []
+    for t, state in cells:
+        if state == "taken":
+            buttons.append(_btn(f"🔒 {t}", "noop"))
+        elif state == "free":
+            buttons.append(_btn(f"🟢 {t}", f"delslot|{date_iso}|{t}"))
+        else:
+            buttons.append(_btn(f"➕ {t}", f"addslot|{date_iso}|{t}"))
+    rows = _grid(buttons, 3)
+    if can_add_all:
+        rows.append([_btn("➕ Добавить всё время", f"addall|{date_iso}")])
+    rows.append([_btn("⬅️ К датам", f"admin|schedule|{back_offset}"), BTN_MENU])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
 
 def build_price_menu_ilkb(current_price):
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="−50 ₽", callback_data="price|dec|50"),
-                InlineKeyboardButton(text="+50 ₽", callback_data="price|inc|50"),
+                _btn("−100", "price|dec|100"),
+                _btn("−50", "price|dec|50"),
+                _btn("+50", "price|inc|50"),
+                _btn("+100", "price|inc|100"),
             ],
-            [InlineKeyboardButton(text="↩️ В меню", callback_data="admin|menu")],
+            [BTN_MENU],
         ]
     )
 
-def admin_back_menu_ilkb():
+
+def build_bookings_ilkb(flt, page, total_pages, counts):
+    """counts: словарь {'act': n, 'chk': n, 'all': n}."""
+    def tab(key, title):
+        mark = "•" if key == flt else ""
+        return _btn(f"{mark}{title} {counts.get(key, 0)}{mark}", f"admin|bookings|{key}|0")
+
+    rows = [[tab("chk", "⏳ Проверка"), tab("act", "📅 Актуальные"), tab("all", "🗂 Все")]]
+    nav = []
+    if page > 0:
+        nav.append(_btn("◀️", f"admin|bookings|{flt}|{page - 1}"))
+    if total_pages > 1:
+        nav.append(_btn(f"{page + 1}/{total_pages}", "noop"))
+    if page < total_pages - 1:
+        nav.append(_btn("▶️", f"admin|bookings|{flt}|{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([BTN_MENU])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_unlock_list_ilkb(items):
+    """items: список (slot_id, label)."""
+    rows = [[_btn(label, f"unlock|ask|{sid}")] for sid, label in items]
+    rows.append([BTN_MENU])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_unlock_confirm_ilkb(slot_id):
     return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="↩️ В меню", callback_data="admin|menu")]]
+        inline_keyboard=[
+            [_btn("✅ Да, разблокировать", f"unlock|do|{slot_id}")],
+            [_btn("⬅️ Назад", "admin|unlock"), BTN_MENU],
+        ]
     )
+
+
+def admin_back_menu_ilkb():
+    return InlineKeyboardMarkup(inline_keyboard=[[BTN_MENU]])
