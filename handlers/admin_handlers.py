@@ -327,15 +327,14 @@ async def admin_bookings_cb(callback: CallbackQuery):
     chunk = items[page * BOOKINGS_PAGE_SIZE:(page + 1) * BOOKINGS_PAGE_SIZE]
 
     titles = {"chk": "⏳ Ждут проверки оплаты", "act": "📅 Актуальные записи", "all": "🗂 Все записи"}
-    lines = [f"📋 <b>{titles[flt]}</b>",
-             "<i>⏳ ждут проверки · 📅 актуальные · 🗂 все</i>", ""]
+    lines = [f"📋 <b>{titles[flt]}</b>", ""]
     if not chunk:
         lines.append("Пока пусто ✨")
     last_date = object()
     for rec in chunk:
         if rec["date"] != last_date:
             last_date = rec["date"]
-            if len(lines) > 3:
+            if len(lines) > 2:
                 lines.append("")
             lines.append(f"<b>{_fmt_date(rec['date'])}</b>" if rec["date"] else "<b>Дата не указана</b>")
         st = STATUS_TEXT.get(rec["status"], escape(str(rec["status"])))

@@ -96,12 +96,11 @@ def build_price_menu_ilkb(current_price):
 
 def build_bookings_ilkb(flt, page, total_pages, counts):
     """counts: словарь {'act': n, 'chk': n, 'all': n}."""
-    def tab(key, icon):
-        n = counts.get(key, 0)
-        text = f"[{icon} {n}]" if key == flt else f"{icon} {n}"
-        return _btn(text, f"admin|bookings|{key}|0")
+    def tab(key, title):
+        text = f"● {title} · {counts.get(key, 0)}" if key == flt else f"{title} · {counts.get(key, 0)}"
+        return [_btn(text, f"admin|bookings|{key}|0")]
 
-    rows = [[tab("chk", "⏳"), tab("act", "📅"), tab("all", "🗂")]]
+    rows = [tab("chk", "⏳ Ждут проверки"), tab("act", "📅 Актуальные"), tab("all", "🗂 Все записи")]
     nav = []
     if page > 0:
         nav.append(_btn("◀️", f"admin|bookings|{flt}|{page - 1}"))
