@@ -79,12 +79,12 @@ async def _main_menu_payload():
         (today, config.STATUS_CHECKING, config.STATUS_WAITING_PAYMENT))
     checking = waiting = stale = 0
     for r in await cur.fetchall():
-        if not r["upcoming"]:
-            stale += r["n"]
-        elif r["status"] == config.STATUS_CHECKING:
-            checking += r["n"]
-        else:
+        if r["status"] == config.STATUS_CHECKING:
+            checking += r["n"]  # неразрешённые оплаты показываем всегда, даже старые
+        elif r["upcoming"]:
             waiting += r["n"]
+        else:
+            stale += r["n"]
     cur = await database.db.execute(
         "SELECT COUNT(*) AS n FROM bookings b LEFT JOIN slots s ON b.slot_id=s.id "
         "WHERE b.status=? AND COALESCE(s.date, b.slot_date_cache) >= ?",
@@ -102,7 +102,7 @@ async def _main_menu_payload():
     if waiting:
         lines.append(f"💳 Ждут оплаты: {waiting}")
     if stale:
-        lines.append(f"🕰 Просрочены без решения: {stale} (в «Все записи»)")
+        lines.append(f"🕰 Просрочены без оплаты: {stale} (в «Все записи»)")
     lines += [
         f"✅ Подтверждено (впереди): {confirmed}",
         f"🟢 Свободных слотов: {free}",
@@ -322,7 +322,7 @@ async def admin_bookings_cb(callback: CallbackQuery):
     today = _today_iso()
     records = await _load_bookings()
     sets = {
-        "chk": [r for r in records if r["status"] == config.STATUS_CHECKING and (r["date"] or "9999") >= today],
+        "chk": [r for r in records if r["status"] == config.STATUS_CHECKING],
         "act": [r for r in records if r["status"] in ACTIVE_STATUSES and (r["date"] or "9999") >= today],
         "all": list(records),
     }
