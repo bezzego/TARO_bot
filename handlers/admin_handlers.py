@@ -73,12 +73,18 @@ async def _main_menu_payload():
     price = await database.get_price()
     today = _today_iso()
     cur = await database.db.execute(
-        "SELECT status, COUNT(*) AS n FROM bookings "
-        "WHERE status IN (?, ?) GROUP BY status",
-        (config.STATUS_CHECKING, config.STATUS_WAITING_PAYMENT))
-    by_status = {r["status"]: r["n"] for r in await cur.fetchall()}
-    checking = by_status.get(config.STATUS_CHECKING, 0)
-    waiting = by_status.get(config.STATUS_WAITING_PAYMENT, 0)
+        "SELECT b.status, COALESCE(s.date, b.slot_date_cache) >= ? AS upcoming, COUNT(*) AS n "
+        "FROM bookings b LEFT JOIN slots s ON b.slot_id=s.id "
+        "WHERE b.status IN (?, ?) GROUP BY b.status, upcoming",
+        (today, config.STATUS_CHECKING, config.STATUS_WAITING_PAYMENT))
+    checking = waiting = stale = 0
+    for r in await cur.fetchall():
+        if not r["upcoming"]:
+            stale += r["n"]
+        elif r["status"] == config.STATUS_CHECKING:
+            checking += r["n"]
+        else:
+            waiting += r["n"]
     cur = await database.db.execute(
         "SELECT COUNT(*) AS n FROM bookings b LEFT JOIN slots s ON b.slot_id=s.id "
         "WHERE b.status=? AND COALESCE(s.date, b.slot_date_cache) >= ?",
@@ -95,6 +101,8 @@ async def _main_menu_payload():
         lines.append("✨ Новых оплат на проверку нет")
     if waiting:
         lines.append(f"💳 Ждут оплаты: {waiting}")
+    if stale:
+        lines.append(f"🕰 Просрочены без решения: {stale} (в «Все записи»)")
     lines += [
         f"✅ Подтверждено (впереди): {confirmed}",
         f"🟢 Свободных слотов: {free}",
@@ -314,7 +322,7 @@ async def admin_bookings_cb(callback: CallbackQuery):
     today = _today_iso()
     records = await _load_bookings()
     sets = {
-        "chk": [r for r in records if r["status"] == config.STATUS_CHECKING],
+        "chk": [r for r in records if r["status"] == config.STATUS_CHECKING and (r["date"] or "9999") >= today],
         "act": [r for r in records if r["status"] in ACTIVE_STATUSES and (r["date"] or "9999") >= today],
         "all": list(records),
     }
