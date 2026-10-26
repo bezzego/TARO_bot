@@ -5,7 +5,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
 import config
-from handlers import user_handlers, admin_handlers
+from handlers import user_handlers, admin_handlers, fallback_handlers
 from scheduler import scheduler, restore_unlock_jobs
 from fsm_storage import SQLiteStorage
 import database
@@ -28,6 +28,7 @@ async def main():
     # Register routers
     dp.include_router(user_handlers.router)
     dp.include_router(admin_handlers.router)
+    dp.include_router(fallback_handlers.router)  # последним
     # Initialize database
     await database.init_db()
     # Start scheduler for background jobs
