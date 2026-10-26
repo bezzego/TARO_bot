@@ -3,11 +3,13 @@ from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMar
 import config
 
 ADMIN_PANEL_BTN = "🔮 Админ-панель"
+CALL_BTN = "📞 Записаться на созвон"
 
 # Main menu keyboard for client
 main_menu_kb = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📅 Записаться")],
+        [KeyboardButton(text=CALL_BTN)],
         [KeyboardButton(text="📋 Выбрать вопрос / расклад")],
         [KeyboardButton(text="📋 Мои записи")],
         [KeyboardButton(text="ℹ Помощь")]
@@ -111,3 +113,11 @@ done_kb = ReplyKeyboardMarkup(
     resize_keyboard=True,
     one_time_keyboard=True
 )
+
+def kb_call_durations():
+    """Выбор длительности созвона."""
+    import bot_texts
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{bot_texts.call_duration(m)} — {bot_texts.money(price)}", callback_data=f"call|{m}")]
+        for m, price in config.CALL_OPTIONS
+    ])

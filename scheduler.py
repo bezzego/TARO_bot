@@ -21,7 +21,7 @@ async def unlock_timeout(booking_id: int):
             slot_id = record["slot_id"]
             user_id = record["user_id"]
             await database.update_booking_status(booking_id, config.STATUS_CANCELLED)
-            await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (slot_id,))
+            await database.free_booking_slots(record)
             await database.db.commit()
             logging.info(f"Auto-unlocked slot {slot_id} for booking {booking_id} (payment timeout)")
             # Notify user

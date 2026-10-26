@@ -34,9 +34,8 @@ async def cancel_command(message: Message, state: FSMContext):
                 status = record["status"]
                 if status in (config.STATUS_WAITING_PAYMENT, config.STATUS_CHECKING):
                     # Cancel booking in DB and free slot
-                    slot_id = record["slot_id"]
                     await database.update_booking_status(booking_id, config.STATUS_CANCELLED)
-                    await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (slot_id,))
+                    await database.free_booking_slots(record)
                     await database.db.commit()
                     logging.info(f"Booking {booking_id} cancelled by user via /cancel")
                     cancelled = True
@@ -273,6 +272,34 @@ async def book_appointment(message: Message, state: FSMContext):
     await message.answer("Пожалуйста, опишите вашу ситуацию (краткая история).", reply_markup=None)
     await state.set_state(BookingState.story)
 
+# --- Созвон ---
+@router.message(F.text == keyboards.CALL_BTN)
+async def book_call(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(bot_texts.call_intro(), reply_markup=keyboards.kb_call_durations(), parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("call|"))
+async def book_call_duration(callback: CallbackQuery, state: FSMContext):
+    try:
+        minutes = int(callback.data.split("|", 1)[1])
+        price = dict(config.CALL_OPTIONS)[minutes]
+    except (ValueError, KeyError):
+        await callback.answer("Эта длительность недоступна.", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(BookingState.story)
+    await state.update_data(call_minutes=minutes, call_price=price)
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(
+        f"{bot_texts.call_summary(minutes, price)}\n\nПожалуйста, опишите вашу ситуацию (краткая история).",
+        parse_mode="HTML")
+    await callback.answer()
+
+
 # State: waiting for the story of the situation
 @router.message(BookingState.story)
 async def receive_story(message: Message, state: FSMContext):
@@ -343,10 +370,17 @@ async def receive_questions(message: Message, state: FSMContext):
     if num_questions == 0:
         await message.answer("Список вопросов пуст. Введите хотя бы один вопрос.")
         return
-    price = await database.get_price()
-    amount = num_questions * price
+    data = await state.get_data()
+    if data.get("call_minutes"):
+        # Созвон: цена фиксирована длительностью, вопросы на неё не влияют
+        amount = data["call_price"]
+        summary = bot_texts.call_summary(data["call_minutes"], amount)
+    else:
+        price = await database.get_price()
+        amount = num_questions * price
+        summary = bot_texts.price_summary(num_questions, amount)
     await state.update_data(questions=questions_text, num_questions=num_questions, amount=amount)
-    await message.answer(bot_texts.price_summary(num_questions, amount), parse_mode="HTML")
+    await message.answer(summary, parse_mode="HTML")
     # Request phone number
     await message.answer("Теперь отправьте свой номер телефона для связи.", reply_markup=keyboards.contact_kb)
     await state.set_state(BookingState.phone)
@@ -378,147 +412,144 @@ async def receive_phone(message: Message, state: FSMContext):
     await database.update_user_phone(user.id, phone_number)
     await state.update_data(phone=phone_number)
     # Show available dates
-    free_dates = await database.get_free_dates()
+    data = await state.get_data()
+    free_dates = await _free_dates(data)
     if not free_dates:
         await message.answer("Извините, сейчас нет доступных дат для записи. Попробуйте позже.", reply_markup=keyboards.menu_for(message.from_user.id))
         await state.clear()
         return
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-
-    date_buttons = []
-    for date_str in free_dates:
-        try:
-            dt = datetime.strptime(date_str, "%Y-%m-%d")
-            display = dt.strftime("%d.%m.%Y")
-        except:
-            display = date_str
-        date_buttons.append([InlineKeyboardButton(text=display, callback_data=f"date|{date_str}")])
-
-    date_kb = InlineKeyboardMarkup(inline_keyboard=date_buttons)
-    await message.answer("Выберите дату:", reply_markup=date_kb)
+    await message.answer("Выберите дату:", reply_markup=_dates_kb(free_dates))
     await state.set_state(BookingState.select_date)
+
+
+# --- Даты и время: общие для расклада и созвона ---
+
+async def _free_dates(data):
+    minutes = data.get("call_minutes")
+    return await database.get_call_free_dates(minutes) if minutes else await database.get_free_dates()
+
+
+async def _free_times(data, date):
+    """[(slot_id, подпись)]; для созвона подпись — интервал «17:00–18:00»."""
+    minutes = data.get("call_minutes")
+    if minutes:
+        return [(first, label) for first, _, label in await database.get_call_starts(date, minutes)]
+    return await database.get_free_times(date)
+
+
+def _dates_kb(dates):
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    rows = []
+    for date_str in dates:
+        try:
+            display = datetime.strptime(date_str, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except Exception:
+            display = date_str
+        rows.append([InlineKeyboardButton(text=display, callback_data=f"date|{date_str}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _times_kb(times):
+    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=label, callback_data=f"time|{slot_id}")] for slot_id, label in times
+    ])
+
+
+async def _back_to_dates(callback: CallbackQuery, state: FSMContext, data):
+    """Вернуть клиента к выбору даты (или завершить, если свободных дат нет)."""
+    free_dates = await _free_dates(data)
+    if free_dates:
+        try:
+            await callback.message.edit_text("Выберите дату:", reply_markup=_dates_kb(free_dates))
+        except Exception:
+            await callback.message.answer("Выберите дату:", reply_markup=_dates_kb(free_dates))
+        await state.set_state(BookingState.select_date)
+    else:
+        await callback.message.edit_text("Свободные слоты отсутствуют.")
+        await state.clear()
+
 
 # State: waiting for date selection (inline button)
 @router.callback_query(BookingState.select_date)
 async def select_date_callback(callback: CallbackQuery, state: FSMContext):
-    data = callback.data
-    if not data or not data.startswith("date|"):
+    if not callback.data or not callback.data.startswith("date|"):
         await callback.answer()
         return
-    selected_date = data.split("|", 1)[1]
-    free_times = await database.get_free_times(selected_date)
+    selected_date = callback.data.split("|", 1)[1]
+    data = await state.get_data()
+    free_times = await _free_times(data, selected_date)
     if not free_times:
         # No times available for that date (possibly taken just now)
         await callback.answer("Нет доступного времени на эту дату.", show_alert=True)
-        free_dates = await database.get_free_dates()
-        if free_dates:
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            date_buttons = []
-            for date_str in free_dates:
-                try:
-                    dt = datetime.strptime(date_str, "%Y-%m-%d")
-                    display = dt.strftime("%d.%m.%Y")
-                except:
-                    display = date_str
-                date_buttons.append([InlineKeyboardButton(text=display, callback_data=f"date|{date_str}")])
-            date_kb = InlineKeyboardMarkup(inline_keyboard=date_buttons)
-            try:
-                await callback.message.edit_text("Выберите дату:", reply_markup=date_kb)
-            except:
-                await callback.message.answer("Выберите дату:", reply_markup=date_kb)
-            # Remain in select_date state
-        else:
-            await callback.message.edit_text("Нет доступных слотов для записи на текущий момент.")
-            await state.clear()
-        await callback.answer()
+        await _back_to_dates(callback, state, data)
         return
-    # List available times for selected date
-    from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-    time_buttons = [
-        [InlineKeyboardButton(text=time, callback_data=f"time|{slot_id}")]
-        for slot_id, time in free_times
-    ]
-    time_kb = InlineKeyboardMarkup(inline_keyboard=time_buttons)
+    date_disp = datetime.strptime(selected_date, '%Y-%m-%d').strftime('%d.%m.%Y')
     try:
-        await callback.message.edit_text(f"Дата {datetime.strptime(selected_date, '%Y-%m-%d').strftime('%d.%m.%Y')} выбрана. Выберите время:", reply_markup=time_kb)
-    except:
-        await callback.message.answer("Выберите время:", reply_markup=time_kb)
+        await callback.message.edit_text(f"Дата {date_disp} выбрана. Выберите время:", reply_markup=_times_kb(free_times))
+    except Exception:
+        await callback.message.answer("Выберите время:", reply_markup=_times_kb(free_times))
     await state.update_data(selected_date=selected_date)
     await state.set_state(BookingState.select_time)
     await callback.answer()
 
+
 # State: waiting for time selection (inline button)
 @router.callback_query(BookingState.select_time)
 async def select_time_callback(callback: CallbackQuery, state: FSMContext):
-    data = callback.data
-    if not data or not data.startswith("time|"):
+    if not callback.data or not callback.data.startswith("time|"):
         await callback.answer()
         return
     try:
-        slot_id = int(data.split("|", 1)[1])
-    except:
+        slot_id = int(callback.data.split("|", 1)[1])
+    except ValueError:
         await callback.answer()
         return
     fsm_data = await state.get_data()
-    story = fsm_data.get("story")
-    participants = fsm_data.get("participants")
-    photos = fsm_data.get("photos", [])
-    questions = fsm_data.get("questions")
-    num_questions = fsm_data.get("num_questions", 0)
     amount = fsm_data.get("amount", 0)
-    user_id = callback.from_user.id
-    booking_id = await database.reserve_slot_and_create_booking(user_id, slot_id, story, participants, photos, questions, num_questions, amount)
+    call_minutes = fsm_data.get("call_minutes")
+    booking_id = None
+    if call_minutes:
+        # Слоты созвона пересчитываем в момент брони: соседние могли занять
+        starts = await database.get_call_starts(fsm_data.get("selected_date"), call_minutes)
+        extra = next((ex for first, ex, _ in starts if first == slot_id), None)
+        if extra is not None:
+            booking_id = await database.reserve_slot_and_create_booking(
+                callback.from_user.id, slot_id, fsm_data.get("story"), fsm_data.get("participants"),
+                fsm_data.get("photos", []), fsm_data.get("questions"), fsm_data.get("num_questions", 0), amount,
+                extra_slot_ids=extra, kind="call", call_minutes=call_minutes)
+    else:
+        booking_id = await database.reserve_slot_and_create_booking(
+            callback.from_user.id, slot_id, fsm_data.get("story"), fsm_data.get("participants"),
+            fsm_data.get("photos", []), fsm_data.get("questions"), fsm_data.get("num_questions", 0), amount)
     if not booking_id:
         # If slot just got taken by someone else
-        free_times = await database.get_free_times(fsm_data.get("selected_date"))
+        free_times = await _free_times(fsm_data, fsm_data.get("selected_date"))
         if free_times:
-            from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-            time_buttons = [
-                [InlineKeyboardButton(text=t, callback_data=f"time|{sid}")]
-                for sid, t in free_times
-            ]
-            time_kb = InlineKeyboardMarkup(inline_keyboard=time_buttons)
             try:
-                await callback.message.edit_text("Выберите время:", reply_markup=time_kb)
-            except:
-                await callback.message.answer("Выберите время:", reply_markup=time_kb)
+                await callback.message.edit_text("Выберите время:", reply_markup=_times_kb(free_times))
+            except Exception:
+                await callback.message.answer("Выберите время:", reply_markup=_times_kb(free_times))
             await callback.answer("Выбранное время уже занято, выберите другое.", show_alert=True)
-            return
         else:
-            # If no times left on that date, go back to date selection
-            free_dates = await database.get_free_dates()
-            if free_dates:
-                from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-                date_buttons = []
-                for date_str in free_dates:
-                    try:
-                        dt = datetime.strptime(date_str, "%Y-%m-%d")
-                        display = dt.strftime("%d.%m.%Y")
-                    except:
-                        display = date_str
-                    date_buttons.append([InlineKeyboardButton(text=display, callback_data=f"date|{date_str}")])
-                date_kb = InlineKeyboardMarkup(inline_keyboard=date_buttons)
-                await callback.message.edit_text("Выберите дату:", reply_markup=date_kb)
-                await state.set_state(BookingState.select_date)
-            else:
-                await callback.message.edit_text("Свободные слоты отсутствуют.")
-                await state.clear()
+            await _back_to_dates(callback, state, fsm_data)
             await callback.answer("Выбранное время уже занято.", show_alert=True)
-            return
+        return
     # Slot reserved and booking created
     await state.update_data(booking_id=booking_id)
     # Remove the times keyboard from the message
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
-    except:
+    except Exception:
         pass
     # Compose payment instructions
     slot_cur = await database.db.execute("SELECT date, time FROM slots WHERE id=?", (slot_id,))
     slot_row = await slot_cur.fetchone()
     if slot_row:
-        date_obj = datetime.strptime(slot_row['date'], "%Y-%m-%d")
-        date_disp = date_obj.strftime("%d.%m.%Y")
+        date_disp = datetime.strptime(slot_row['date'], "%Y-%m-%d").strftime("%d.%m.%Y")
         time_str = slot_row['time']
+        if call_minutes:
+            time_str = f"{time_str}–{database._add_minutes(time_str, call_minutes)} (созвон {bot_texts.call_duration(call_minutes)})"
     else:
         date_disp = fsm_data.get('selected_date')
         time_str = ""
@@ -611,6 +642,8 @@ async def list_bookings(message: Message):
             else:
                 status_text = status
             date_display = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
+            if rec["kind"] == "call":
+                time = f"{time}–{database._add_minutes(time, rec['call_minutes'])} 📞 созвон"
             text_lines.append(f"- {date_display} {time} — {status_text}")
             if cancel_allowed:
                 buttons.append([InlineKeyboardButton(text=f"Отменить {date_display} {time}", callback_data=f"cancel|{rec['id']}")])
@@ -635,7 +668,7 @@ async def cancel_booking_callback(callback: CallbackQuery, state: FSMContext):
         return
     if status in (config.STATUS_WAITING_PAYMENT, config.STATUS_CHECKING):
         await database.update_booking_status(booking_id, config.STATUS_CANCELLED)
-        await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (record["slot_id"],))
+        await database.free_booking_slots(record)
         await database.db.commit()
         logging.info(f"Booking {booking_id} cancelled by user via inline button")
         # Remove scheduled unlock job (if any)

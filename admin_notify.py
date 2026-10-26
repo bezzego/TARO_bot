@@ -12,6 +12,7 @@ from html import escape
 
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 
+import bot_texts
 import config
 import database
 
@@ -77,7 +78,8 @@ async def send_booking_to_admin(booking_id, receipt_file_id=None, payment_info="
     for i in range(0, len(photos), 10):  # в альбоме максимум 10 фото
         media = [InputMediaPhoto(media=pid) for pid in photos[i:i + 10]]
         if i == 0:
-            media[0] = InputMediaPhoto(media=photos[0], caption=f"Фото участников (запись #{booking_id})")
+            label = "созвон" if d["kind"] == "call" else "запись"
+            media[0] = InputMediaPhoto(media=photos[0], caption=f"Фото участников ({label} #{booking_id})")
         try:
             await _call(config.bot.send_media_group, media=media)
         except Exception as e:
@@ -85,7 +87,7 @@ async def send_booking_to_admin(booking_id, receipt_file_id=None, payment_info="
 
     # Чек
     if receipt_file_id:
-        caption = f"Чек от @{username or user_name}"
+        caption = f"{'📞 Созвон. ' if d['kind'] == 'call' else ''}Чек от @{username or user_name}"
         if payment_info:
             caption += f"\n{payment_info}"
         try:
@@ -98,8 +100,14 @@ async def send_booking_to_admin(booking_id, receipt_file_id=None, payment_info="
         date_disp = datetime.strptime(d["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
     except Exception:
         date_disp = d["date"] or ""
+    is_call = d["kind"] == "call"
+    time_disp = d["time"] or ""
+    if is_call and time_disp:
+        time_disp = f"{time_disp}–{database._add_minutes(time_disp, d['call_minutes'])}"
+    title = (f"📞📞 <b>СОЗВОН · {bot_texts.call_duration(d['call_minutes'])}</b> · запись #{booking_id}"
+             if is_call else f"📌 <b>Запись #{booking_id}</b>")
     header = (
-        f"📌 <b>Запись #{booking_id}</b>{' (повторно)' if resent else ''}\n\n"
+        f"{title}{' (повторно)' if resent else ''}\n\n"
         f"👤 <b>Клиент:</b> {escape(user_name)} (@{escape(username)})\n"
         f"📞 <b>Телефон:</b> {escape(d['phone'] or '')}\n\n"
     )
@@ -109,7 +117,7 @@ async def send_booking_to_admin(booking_id, receipt_file_id=None, payment_info="
         (f"❓ <b>Количество вопросов:</b> {d['num_questions']}\n💬 <b>Вопросы:</b>", d["questions"] or ""),
     ]
     footer = (
-        f"📅 <b>Дата:</b> {date_disp}  ⏰ <b>Время:</b> {d['time'] or ''}\n"
+        f"📅 <b>Дата:</b> {date_disp}  ⏰ <b>Время:</b> {time_disp}\n"
         f"💵 <b>Сумма:</b> {d['amount']} ₽\n"
         f"⏳ <b>Статус:</b> Ожидает подтверждения оплаты"
     )
@@ -120,7 +128,7 @@ async def send_booking_to_admin(booking_id, receipt_file_id=None, payment_info="
         # Длинные поля — отдельными сообщениями, карточка — коротко
         for title, text in sections:
             for n, part in enumerate(_chunks(text)):
-                prefix = f"#{booking_id} · {title}" + (" (продолжение)" if n else "")
+                prefix = f"{'📞 СОЗВОН ' if is_call else ''}#{booking_id} · {title}" + (" (продолжение)" if n else "")
                 try:
                     await _call(config.bot.send_message, text=f"{prefix}\n{escape(part)}")
                 except Exception as e:

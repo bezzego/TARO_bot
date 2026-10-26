@@ -175,9 +175,9 @@ def _base_times():
 
 async def show_date_screen(callback: CallbackQuery, date_iso: str):
     cur = await database.db.execute(
-        "SELECT s.time, s.is_taken, u.name AS name, u.username AS username "
+        "SELECT s.time, s.is_taken, u.name AS name, u.username AS username, b.kind, b.call_minutes "
         "FROM slots s "
-        "LEFT JOIN bookings b ON b.slot_id = s.id AND b.status NOT IN (?, ?) "
+        f"LEFT JOIN bookings b ON {database.BOOKING_HAS_SLOT_SQL} AND b.status NOT IN (?, ?) "
         "LEFT JOIN users u ON u.user_id = b.user_id "
         "WHERE s.date=? ORDER BY s.time",
         (config.STATUS_CANCELLED, config.STATUS_REJECTED, date_iso))
@@ -205,7 +205,8 @@ async def show_date_screen(callback: CallbackQuery, date_iso: str):
         lines.append("<b>Записаны:</b>")
         for r in taken:
             who = _client(r["name"], r["username"]) if r["name"] else "—"
-            lines.append(f"🔒 {r['time']} — {who}")
+            mark = f" 📞 созвон {r['call_minutes']} мин" if r["kind"] == "call" else ""
+            lines.append(f"🔒 {r['time']} — {who}{mark}")
         lines.append("")
     lines.append("🟢 свободный — нажмите, чтобы убрать\n➕ нет в расписании — нажмите, чтобы добавить\n🔒 занят")
 
@@ -302,7 +303,7 @@ async def _load_bookings():
     cur = await database.db.execute(
         "SELECT COALESCE(s.date, b.slot_date_cache) AS date, "
         "COALESCE(s.time, b.slot_time_cache) AS time, "
-        "b.status, u.name AS user_name, u.username AS username "
+        "b.status, u.name AS user_name, u.username AS username, b.kind, b.call_minutes "
         "FROM bookings b JOIN users u ON b.user_id = u.user_id "
         "LEFT JOIN slots s ON b.slot_id = s.id "
         "ORDER BY COALESCE(s.date, b.slot_date_cache), COALESCE(s.time, b.slot_time_cache)")
@@ -347,7 +348,8 @@ async def admin_bookings_cb(callback: CallbackQuery):
                 lines.append("")
             lines.append(f"<b>{_fmt_date(rec['date'])}</b>" if rec["date"] else "<b>Дата не указана</b>")
         st = STATUS_TEXT.get(rec["status"], escape(str(rec["status"])))
-        lines.append(f"  {rec['time'] or '--:--'} · {_client(rec['user_name'], rec['username'])}\n      {st}")
+        call = f"📞 <b>СОЗВОН {rec['call_minutes']} мин</b> · " if rec["kind"] == "call" else ""
+        lines.append(f"  {rec['time'] or '--:--'} · {call}{_client(rec['user_name'], rec['username'])}\n      {st}")
     kb = keyboards.build_bookings_ilkb(flt, page, total_pages, counts)
     await _show(callback, "\n".join(lines), kb)
     await callback.answer()
@@ -366,9 +368,9 @@ class _Collector:
 
 async def _taken_slots():
     cur = await database.db.execute(
-        "SELECT s.id, s.date, s.time, u.name AS name, u.username AS username "
+        "SELECT s.id, s.date, s.time, u.name AS name, u.username AS username, b.kind "
         "FROM slots s "
-        "LEFT JOIN bookings b ON b.slot_id = s.id AND b.status NOT IN (?, ?) "
+        f"LEFT JOIN bookings b ON {database.BOOKING_HAS_SLOT_SQL} AND b.status NOT IN (?, ?) "
         "LEFT JOIN users u ON u.user_id = b.user_id "
         "WHERE s.is_taken=1 AND s.date >= ? ORDER BY s.date, s.time LIMIT 40",
         (config.STATUS_CANCELLED, config.STATUS_REJECTED, _today_iso()))
@@ -385,7 +387,7 @@ async def admin_unlock_list(callback: CallbackQuery):
     else:
         text = ("🔓 <b>Занятые слоты</b>\n\nВыберите слот. Запись клиента будет отменена, "
                 "а слот снова станет свободным.")
-    items = [(r["id"], f"{_fmt_date(r['date'])} {r['time']} · {(r['name'] or 'без записи')[:20]}") for r in slots]
+    items = [(r["id"], f"{_fmt_date(r['date'])} {r['time']} · {'📞 ' if r['kind'] == 'call' else ''}{(r['name'] or 'без записи')[:20]}") for r in slots]
     await _show(callback, text, keyboards.build_unlock_list_ilkb(items))
     await callback.answer()
 
@@ -669,8 +671,8 @@ async def handle_unlock(date_iso: str, time_fmt: str, message: Message):
         return
     # Slot is taken, find active booking for this slot
     cur_b = await database.db.execute(
-        "SELECT id, status, user_id, admin_message_id FROM bookings WHERE slot_id=? AND status NOT IN (?, ?)",
-        (slot_id, config.STATUS_CANCELLED, config.STATUS_REJECTED)
+        "SELECT * FROM bookings WHERE (slot_id=? OR extra_slots LIKE ?) AND status NOT IN (?, ?)",
+        (slot_id, f"%,{slot_id},%", config.STATUS_CANCELLED, config.STATUS_REJECTED)
     )
     booking = await cur_b.fetchone()
     if booking is None:
@@ -682,12 +684,15 @@ async def handle_unlock(date_iso: str, time_fmt: str, message: Message):
         return
     booking_id = booking["id"]
     status = booking["status"]
+    # Для созвона клиенту называем начало созвона, а не нажатый слот
+    date_iso = booking["slot_date_cache"] or date_iso
+    time_fmt = booking["slot_time_cache"] or time_fmt
     user_id = booking["user_id"]
     admin_msg_id = booking["admin_message_id"]
     if status == config.STATUS_WAITING_PAYMENT:
         # Cancel booking and free slot
         await database.update_booking_status(booking_id, config.STATUS_CANCELLED)
-        await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (slot_id,))
+        await database.free_booking_slots(booking)
         await database.db.commit()
         from scheduler import scheduler
         try:
@@ -703,7 +708,7 @@ async def handle_unlock(date_iso: str, time_fmt: str, message: Message):
     elif status == config.STATUS_CHECKING:
         # Payment was sent but not confirmed yet – reject it
         await database.update_booking_status(booking_id, config.STATUS_REJECTED)
-        await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (slot_id,))
+        await database.free_booking_slots(booking)
         await database.db.commit()
         try:
             await config.bot.send_message(user_id, "Оплата не подтверждена, ваша запись отклонена. Слот освобожден.")
@@ -719,7 +724,7 @@ async def handle_unlock(date_iso: str, time_fmt: str, message: Message):
     elif status == config.STATUS_CONFIRMED:
         # Booking was confirmed – cancel it
         await database.update_booking_status(booking_id, config.STATUS_CANCELLED)
-        await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (slot_id,))
+        await database.free_booking_slots(booking)
         await database.db.commit()
         try:
             await config.bot.send_message(user_id, f"Ваша подтвержденная запись на {datetime.strptime(date_iso, '%Y-%m-%d').strftime('%d.%m.%Y')} {time_fmt} отменена администратором.")
@@ -771,7 +776,12 @@ async def confirm_payment(callback: CallbackQuery):
     date_disp = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
     # Notify user
     try:
-        await config.bot.send_message(user_id, f"Ваша запись подтверждена, расклад будет отправлен {date_disp} с 13:00 до 18:00 (МСК).")
+        if details["kind"] == "call":
+            end = database._add_minutes(time, details["call_minutes"])
+            text = f"Ваша запись на созвон подтверждена: {date_disp} с {time} до {end} (МСК)."
+        else:
+            text = f"Ваша запись подтверждена, расклад будет отправлен {date_disp} с 13:00 до 18:00 (МСК)."
+        await config.bot.send_message(user_id, text)
     except Exception as e:
         logging.error(f"Failed to notify user {user_id} of confirmation: {e}")
     # Update admin group's message text
@@ -801,22 +811,12 @@ async def reject_payment(callback: CallbackQuery):
     logging.debug(f"reject_payment details keys: {list(details.keys())}")
     # Mark as rejected and free slot
     await database.update_booking_status(booking_id, config.STATUS_REJECTED)
-    slot_id = details["slot_id"] if "slot_id" in details.keys() else None
-    if not slot_id:
-        # Попробуем найти слот по дате и времени, если slot_id не передан
-        cur = await database.db.execute(
-            "SELECT id FROM slots WHERE date=? AND time=?",
-            (details["date"], details["time"])
-        )
-        row = await cur.fetchone()
-        slot_id = row["id"] if row else None
-    if slot_id:
-        await database.db.execute("UPDATE slots SET is_taken=0 WHERE id=?", (slot_id,))
+    record = await database.get_booking_by_id(booking_id)
+    if record and database.booking_slot_ids(record):
+        await database.free_booking_slots(record)
         await database.db.commit()
     else:
-        logging.error(f"reject_payment: slot_id not found in details for booking {booking_id}")
-        await callback.answer("Ошибка: слот не найден для этой записи.", show_alert=True)
-        return
+        logging.error(f"reject_payment: no slots for booking {booking_id}")
     user_id = details["user_id"]
     date = details["date"]; time = details["time"]
     date_disp = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")

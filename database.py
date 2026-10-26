@@ -76,9 +76,12 @@ async def init_db():
     # Ensure cache columns exist in bookings table for historical slot data
     # created_at — время создания брони (локальное время сервера, ISO), нужно, чтобы после рестарта
     # восстановить таймер автоотмены неоплаченной брони
-    for column in ("slot_date_cache", "slot_time_cache", "created_at"):
+    # kind — 'call' для созвона (NULL = обычный расклад), call_minutes — длительность,
+    # extra_slots — остальные слоты созвона в виде ",12,13," (первый слот — slot_id)
+    for column, col_type in (("slot_date_cache", "TEXT"), ("slot_time_cache", "TEXT"), ("created_at", "TEXT"),
+                             ("kind", "TEXT"), ("call_minutes", "INTEGER"), ("extra_slots", "TEXT")):
         try:
-            await db.execute(f"ALTER TABLE bookings ADD COLUMN {column} TEXT")
+            await db.execute(f"ALTER TABLE bookings ADD COLUMN {column} {col_type}")
             logging.info(f"Added missing column {column} to bookings table")
         except aiosqlite.OperationalError as e:
             if "duplicate column name" not in str(e).lower():
@@ -166,8 +169,11 @@ async def remove_slot(date: str, time: str):
     logging.info(f"Removed slot {date} {time}")
     return 1
 
-async def reserve_slot_and_create_booking(user_id: int, slot_id: int, story: str, participants: str, photo_ids: list, questions: str, num_questions: int, amount: int):
-    """Reserve a slot (if available) and create a booking entry. Returns booking_id or None if slot already taken."""
+async def reserve_slot_and_create_booking(user_id: int, slot_id: int, story: str, participants: str, photo_ids: list, questions: str, num_questions: int, amount: int,
+                                         extra_slot_ids: list = None, kind: str = None, call_minutes: int = None):
+    """Reserve a slot (if available) and create a booking entry. Returns booking_id or None if slot already taken.
+    Для созвона extra_slot_ids — остальные слоты подряд; занимаются все или ни одного."""
+    extra_slot_ids = extra_slot_ids or []
     try:
         await db.execute("BEGIN")
         slot_cur = await db.execute("SELECT date, time FROM slots WHERE id=?", (slot_id,))
@@ -175,15 +181,18 @@ async def reserve_slot_and_create_booking(user_id: int, slot_id: int, story: str
         if slot_row is None:
             await db.execute("ROLLBACK")
             return None
-        cur = await db.execute("UPDATE slots SET is_taken=1 WHERE id=? AND is_taken=0", (slot_id,))
-        if cur.rowcount == 0:
-            await db.execute("ROLLBACK")
-            return None
+        for sid in [slot_id] + extra_slot_ids:
+            cur = await db.execute("UPDATE slots SET is_taken=1 WHERE id=? AND is_taken=0", (sid,))
+            if cur.rowcount == 0:
+                await db.execute("ROLLBACK")
+                return None
         photos_json = json.dumps(photo_ids) if photo_ids is not None else json.dumps([])
+        extra = "," + ",".join(str(i) for i in extra_slot_ids) + "," if extra_slot_ids else None
         await db.execute(
-            "INSERT INTO bookings (user_id, slot_id, story, participants, photos, questions, num_questions, amount, status, admin_message_id, slot_date_cache, slot_time_cache, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, slot_id, story, participants, photos_json, questions, num_questions, amount, config.STATUS_WAITING_PAYMENT, None, slot_row["date"], slot_row["time"], datetime.now().isoformat(timespec="seconds"))
+            "INSERT INTO bookings (user_id, slot_id, story, participants, photos, questions, num_questions, amount, status, admin_message_id, slot_date_cache, slot_time_cache, created_at, kind, call_minutes, extra_slots) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, slot_id, story, participants, photos_json, questions, num_questions, amount, config.STATUS_WAITING_PAYMENT, None, slot_row["date"], slot_row["time"], datetime.now().isoformat(timespec="seconds"),
+             kind, call_minutes, extra)
         )
         # Get last inserted booking id
         cur2 = await db.execute("SELECT last_insert_rowid()")
@@ -213,6 +222,57 @@ async def get_free_times(date: str):
     rows = await cur.fetchall()
     return [(row["id"], row["time"]) for row in rows]
 
+SLOT_STEP_MIN = 20  # шаг сетки слотов
+
+
+def booking_slot_ids(record) -> list:
+    """Все слоты брони: основной + дополнительные (у созвона)."""
+    ids = [record["slot_id"]] if record["slot_id"] else []
+    extra = record["extra_slots"] if "extra_slots" in record.keys() else None
+    if extra:
+        ids += [int(x) for x in extra.strip(",").split(",") if x]
+    return ids
+
+
+async def free_booking_slots(record):
+    """Освобождает все слоты брони (без commit)."""
+    ids = booking_slot_ids(record)
+    if ids:
+        await db.execute(f"UPDATE slots SET is_taken=0 WHERE id IN ({','.join('?' * len(ids))})", ids)
+
+
+# Условие «бронь b занимает слот s» — для JOIN-ов по слотам
+BOOKING_HAS_SLOT_SQL = "(b.slot_id = s.id OR b.extra_slots LIKE '%,' || s.id || ',%')"
+
+
+def _add_minutes(hhmm: str, minutes: int) -> str:
+    h, m = map(int, hhmm.split(":"))
+    total = h * 60 + m + minutes
+    return f"{total // 60 % 24:02d}:{total % 60:02d}"
+
+
+def call_slots_needed(minutes: int) -> int:
+    return -(-minutes // SLOT_STEP_MIN)
+
+
+async def get_call_starts(date: str, minutes: int):
+    """[(first_slot_id, [остальные id], 'ЧЧ:ММ–ЧЧ:ММ')] — когда можно начать созвон:
+    нужное число свободных слотов подряд с шагом 20 минут."""
+    n = call_slots_needed(minutes)
+    cur = await db.execute("SELECT id, time, is_taken FROM slots WHERE date=? ORDER BY time", (date,))
+    by_time = {r["time"]: r for r in await cur.fetchall()}
+    result = []
+    for t, r in by_time.items():
+        chain = [by_time.get(_add_minutes(t, k * SLOT_STEP_MIN)) for k in range(n)]
+        if all(c is not None and not c["is_taken"] for c in chain):
+            result.append((chain[0]["id"], [c["id"] for c in chain[1:]], f"{t}–{_add_minutes(t, minutes)}"))
+    return result
+
+
+async def get_call_free_dates(minutes: int):
+    return [d for d in await get_free_dates() if await get_call_starts(d, minutes)]
+
+
 async def get_booking_by_id(booking_id: int):
     """Get a booking record by ID."""
     cur = await db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,))
@@ -221,6 +281,7 @@ async def get_booking_by_id(booking_id: int):
 async def get_booking_details(booking_id: int):
     """Get detailed booking info joined with user and slot."""
     query = """SELECT b.id, b.status, b.num_questions, b.amount, b.story, b.participants, b.questions, b.photos, b.admin_message_id,
+                      b.kind, b.call_minutes,
                       u.name as user_name, u.username as username, u.phone as phone,
                       COALESCE(s.date, b.slot_date_cache) as date,
                       COALESCE(s.time, b.slot_time_cache) as time,
@@ -245,7 +306,7 @@ async def set_booking_admin_message_id(booking_id: int, message_id: int):
 async def get_user_bookings(user_id: int):
     """Get list of upcoming bookings for a user (excluding cancelled/rejected)."""
     today = datetime.now().strftime("%Y-%m-%d")
-    query = """SELECT b.id, b.status, s.date, s.time 
+    query = """SELECT b.id, b.status, s.date, s.time, b.kind, b.call_minutes
                FROM bookings b JOIN slots s ON b.slot_id = s.id
                WHERE b.user_id = ? AND b.status NOT IN (?, ?) AND s.date >= ?
                ORDER BY s.date, s.time"""

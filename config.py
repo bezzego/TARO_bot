@@ -34,3 +34,14 @@ STATUS_CANCELLED = "CANCELLED"
 
 # Global bot instance (will be set in bot.py)
 bot = None
+
+# Созвоны: (минуты, цена ₽). Созвон занимает слоты по 20 минут подряд.
+CALL_OPTIONS = [
+    (20, 1667),
+    (30, 2500),
+    (40, 3333),
+    (50, 4167),
+    (60, 5000),
+    (90, 7500),
+    (120, 10000),
+]
