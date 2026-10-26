@@ -11,6 +11,7 @@ import config
 import database
 import keyboards
 import bot_texts
+import admin_notify
 import spreads_data
 from states import BookingState, ChooseQuestionState
 
@@ -358,7 +359,7 @@ async def receive_phone(message: Message, state: FSMContext):
         phone_number = message.contact.phone_number
     elif message.text:
         raw = message.text.strip()
-        digits = re.sub(r"\\D", "", raw)
+        digits = re.sub(r"\D", "", raw)
         if raw.startswith('+'):
             phone_number = '+' + digits
         else:
@@ -366,7 +367,7 @@ async def receive_phone(message: Message, state: FSMContext):
                 phone_number = '+7' + digits[1:]
             else:
                 phone_number = '+' + digits
-        clean_digits = re.sub(r"\\D", "", phone_number)
+        clean_digits = re.sub(r"\D", "", phone_number)
         if len(clean_digits) < 10 or len(clean_digits) > 15:
             phone_number = None
     if not phone_number:
@@ -526,7 +527,7 @@ async def select_time_callback(callback: CallbackQuery, state: FSMContext):
     await state.set_state(BookingState.payment_info)
     # Schedule auto-unlock job in 15 minutes
     from scheduler import scheduler, unlock_timeout
-    run_time = datetime.now() + timedelta(minutes=15)
+    run_time = datetime.now() + timedelta(minutes=15)  # = scheduler.PAYMENT_TIMEOUT
     try:
         scheduler.add_job(unlock_timeout, "date", run_date=run_time, args=[booking_id], id=f"unlock_{booking_id}")
     except Exception as e:
@@ -569,121 +570,15 @@ async def receive_receipt(message: Message, state: FSMContext):
     except Exception as e:
         logging.warning(f"Unlock job removal failed or not found: {e}")
     # Notify admin group with booking details
-    details = await database.get_booking_details(booking_id)
-    if details:
-        user_name = details["user_name"] or ""
-        username = details["username"] or ""
-        phone = details["phone"] or ""
-        story = details["story"] or ""
-        participants = details["participants"] or ""
-        questions = details["questions"] or ""
-        date = details["date"] or ""
-        time = details["time"] or ""
-        num_q = details["num_questions"]
-        amount = details["amount"]
-        photos_json = details["photos"]
-        participant_photos = []
-        if photos_json:
-            try:
-                participant_photos = json.loads(photos_json)
-            except:
-                participant_photos = []
-        # Send participants' photos to admin group
+    ok = await admin_notify.send_booking_to_admin(
+        booking_id, receipt_file_id=message.photo[-1].file_id, payment_info=data.get("payment_info", ""))
+    if not ok and config.ADMIN_GROUP_ID:
+        # Хотя бы короткое оповещение: запись есть в /admin → Записи → Ждут проверки
         try:
-            if participant_photos:
-                media_group = []
-                for idx, pid in enumerate(participant_photos):
-                    if idx == 0:
-                        media_group.append(InputMediaPhoto(media=pid, caption=f"Фото участников (запись #{booking_id})"))
-                    else:
-                        media_group.append(InputMediaPhoto(media=pid))
-                await config.bot.send_media_group(chat_id=config.ADMIN_GROUP_ID, media=media_group)
+            await config.bot.send_message(config.ADMIN_GROUP_ID,
+                f"⚠️ Запись #{booking_id}: чек получен, но карточку отправить не удалось. Смотрите /admin → Записи.")
         except Exception as e:
-            # Handle possible supergroup migration: extract new chat id and retry once
-            err_text = str(e)
-            logging.error(f"Failed to send participant photos to admin group: {err_text}")
-            m = re.search(r"-100\d+", err_text)
-            if m:
-                try:
-                    new_id = int(m.group())
-                    config.ADMIN_GROUP_ID = new_id
-                    logging.info(f"Detected admin group migration. Updating ADMIN_GROUP_ID to {new_id} and retrying media group send.")
-                    if participant_photos:
-                        media_group = []
-                        for idx, pid in enumerate(participant_photos):
-                            if idx == 0:
-                                media_group.append(InputMediaPhoto(media=pid, caption=f"Фото участников (запись #{booking_id})"))
-                            else:
-                                media_group.append(InputMediaPhoto(media=pid))
-                        await config.bot.send_media_group(chat_id=config.ADMIN_GROUP_ID, media=media_group)
-                except Exception as e2:
-                    logging.error(f"Retry after migration failed: {e2}")
-        # Send payment receipt photo
-        try:
-            receipt_file_id = message.photo[-1].file_id
-            payment_info = data.get("payment_info", "")
-            caption = f"Чек от @{username or user_name}\n{payment_info}" if payment_info else f"Чек от @{username or user_name}"
-            await config.bot.send_photo(chat_id=config.ADMIN_GROUP_ID, photo=receipt_file_id, caption=caption)
-        except Exception as e:
-            err_text = str(e)
-            logging.error(f"Failed to send receipt photo to admin group: {err_text}")
-            m = re.search(r"-100\d+", err_text)
-            if m:
-                try:
-                    new_id = int(m.group())
-                    config.ADMIN_GROUP_ID = new_id
-                    logging.info(f"Detected admin group migration. Updating ADMIN_GROUP_ID to {new_id} and retrying receipt send.")
-                    payment_info = data.get("payment_info", "")
-                    caption = f"Чек от @{username or user_name}\n{payment_info}" if payment_info else f"Чек от @{username or user_name}"
-                    await config.bot.send_photo(chat_id=config.ADMIN_GROUP_ID, photo=receipt_file_id, caption=caption)
-                except Exception as e2:
-                    logging.error(f"Retry after migration (receipt) failed: {e2}")
-        # Send booking details text with inline confirm/reject buttons
-        details_text = (
-            f"📌 <b>Запись #{booking_id}</b>\n\n"
-            f"👤 <b>Клиент:</b> {user_name} (@{username})\n"
-            f"📞 <b>Телефон:</b> {phone}\n\n"
-            f"📖 <b>История:</b>\n{story}\n\n"
-            f"👥 <b>Участники:</b>\n{participants}\n\n"
-            f"❓ <b>Количество вопросов:</b> {num_q}\n"
-            f"💬 <b>Вопросы:</b>\n{questions}\n\n"
-            f"📅 <b>Дата:</b> {datetime.strptime(date, '%Y-%m-%d').strftime('%d.%m.%Y')}  ⏰ <b>Время:</b> {time}\n"
-            f"💵 <b>Сумма:</b> {amount} ₽\n"
-            f"⏳ <b>Статус:</b> Ожидает подтверждения оплаты"
-        )
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        admin_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [
-                InlineKeyboardButton(text="✅ Подтвердить чек", callback_data=f"confirm|{booking_id}"),
-                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject|{booking_id}")
-            ]
-        ])
-        try:
-            sent_msg = await config.bot.send_message(
-                chat_id=config.ADMIN_GROUP_ID,
-                text=details_text,
-                reply_markup=admin_kb,
-                parse_mode="HTML"
-            )
-            await database.set_booking_admin_message_id(booking_id, sent_msg.message_id)
-        except Exception as e:
-            err_text = str(e)
-            logging.error(f"Failed to send booking details to admin group: {err_text}")
-            m = re.search(r"-100\d+", err_text)
-            if m:
-                try:
-                    new_id = int(m.group())
-                    config.ADMIN_GROUP_ID = new_id
-                    logging.info(f"Detected admin group migration. Updating ADMIN_GROUP_ID to {new_id} and retrying details send.")
-                    sent_msg = await config.bot.send_message(
-                        chat_id=config.ADMIN_GROUP_ID,
-                        text=details_text,
-                        reply_markup=admin_kb,
-                        parse_mode="HTML"
-                    )
-                    await database.set_booking_admin_message_id(booking_id, sent_msg.message_id)
-                except Exception as e2:
-                    logging.error(f"Retry after migration (details) failed: {e2}")
+            logging.error(f"Failed to send fallback admin alert for booking {booking_id}: {e}")
     # Acknowledge user
     await message.answer("Чек получен. Ожидайте подтверждения администрации.", reply_markup=keyboards.menu_for(message.from_user.id))
     await state.clear()

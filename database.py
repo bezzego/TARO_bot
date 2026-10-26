@@ -66,8 +66,17 @@ async def init_db():
         logging.info(f"Default price_per_question set to {default_price}")
     await db.commit()
 
+    await db.execute(
+        """CREATE TABLE IF NOT EXISTS fsm (
+                key   TEXT PRIMARY KEY,
+                state TEXT,
+                data  TEXT
+            )""")
+
     # Ensure cache columns exist in bookings table for historical slot data
-    for column in ("slot_date_cache", "slot_time_cache"):
+    # created_at — время создания брони (локальное время сервера, ISO), нужно, чтобы после рестарта
+    # восстановить таймер автоотмены неоплаченной брони
+    for column in ("slot_date_cache", "slot_time_cache", "created_at"):
         try:
             await db.execute(f"ALTER TABLE bookings ADD COLUMN {column} TEXT")
             logging.info(f"Added missing column {column} to bookings table")
@@ -172,9 +181,9 @@ async def reserve_slot_and_create_booking(user_id: int, slot_id: int, story: str
             return None
         photos_json = json.dumps(photo_ids) if photo_ids is not None else json.dumps([])
         await db.execute(
-            "INSERT INTO bookings (user_id, slot_id, story, participants, photos, questions, num_questions, amount, status, admin_message_id, slot_date_cache, slot_time_cache) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, slot_id, story, participants, photos_json, questions, num_questions, amount, config.STATUS_WAITING_PAYMENT, None, slot_row["date"], slot_row["time"])
+            "INSERT INTO bookings (user_id, slot_id, story, participants, photos, questions, num_questions, amount, status, admin_message_id, slot_date_cache, slot_time_cache, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, slot_id, story, participants, photos_json, questions, num_questions, amount, config.STATUS_WAITING_PAYMENT, None, slot_row["date"], slot_row["time"], datetime.now().isoformat(timespec="seconds"))
         )
         # Get last inserted booking id
         cur2 = await db.execute("SELECT last_insert_rowid()")

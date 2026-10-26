@@ -1,4 +1,5 @@
 import logging
+import re
 from html import escape
 from datetime import datetime, timedelta
 
@@ -24,7 +25,7 @@ except Exception:
 router = Router()
 
 STATUS_TEXT = {
-    config.STATUS_WAITING_PAYMENT: "💳 ждёт оплаты",
+    config.STATUS_WAITING_PAYMENT: "💳 бронь без чека (не оплачено)",
     config.STATUS_CHECKING: "⏳ проверка оплаты",
     config.STATUS_CONFIRMED: "✅ подтверждена",
     config.STATUS_REJECTED: "❌ отклонена",
@@ -734,6 +735,14 @@ async def handle_unlock(date_iso: str, time_fmt: str, message: Message):
     else:
         await message.answer("Запись уже отменена.")
         
+def _with_status(msg: Message, status: str) -> str:
+    """HTML карточки с заменённой строкой статуса (html_text сохраняет разметку и экранирование)."""
+    html = msg.html_text or ""
+    if "Статус:" in html:
+        return re.sub(r"Статус:(</b>)?.*\Z", lambda m: f"Статус:{m.group(1) or ''} {status}", html, flags=re.S)
+    return f"{html}\nСтатус: {status}"
+
+
 # Admin: confirm payment (from inline button in admin group)
 @router.callback_query(lambda c: c.data and c.data.startswith('confirm|'))
 async def confirm_payment(callback: CallbackQuery):
@@ -768,12 +777,7 @@ async def confirm_payment(callback: CallbackQuery):
     # Update admin group's message text
     if details["admin_message_id"]:
         try:
-            text = callback.message.text or ""
-            if "Статус:" in text:
-                new_text = text.split("Статус:")[0] + "Статус: Подтверждена"
-            else:
-                new_text = text + "\nСтатус: Подтверждена"
-            await callback.message.edit_text(new_text)
+            await callback.message.edit_text(_with_status(callback.message, "Подтверждена"))
         except Exception as e:
             logging.error(f"Failed to edit admin group message text: {e}")
     await callback.answer("✅ Подтверждено")
@@ -824,12 +828,7 @@ async def reject_payment(callback: CallbackQuery):
     # Update admin group's message text
     if details["admin_message_id"]:
         try:
-            text = callback.message.text or ""
-            if "Статус:" in text:
-                new_text = text.split("Статус:")[0] + "Статус: Отклонена"
-            else:
-                new_text = text + "\nСтатус: Отклонена"
-            await callback.message.edit_text(new_text)
+            await callback.message.edit_text(_with_status(callback.message, "Отклонена"))
         except Exception as e:
             logging.error(f"Failed to edit admin group message text on reject: {e}")
     await callback.answer("❌ Отклонено", show_alert=False)

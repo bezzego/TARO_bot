@@ -6,7 +6,8 @@ from aiogram.client.default import DefaultBotProperties
 
 import config
 from handlers import user_handlers, admin_handlers
-from scheduler import scheduler
+from scheduler import scheduler, restore_unlock_jobs
+from fsm_storage import SQLiteStorage
 import database
 
 async def main():
@@ -21,7 +22,7 @@ async def main():
         token=config.BOT_TOKEN,
         default=DefaultBotProperties(parse_mode="HTML")
     )
-    dp = Dispatcher()
+    dp = Dispatcher(storage=SQLiteStorage())
     # Set global bot instance for use in other modules
     config.bot = bot
     # Register routers
@@ -31,6 +32,7 @@ async def main():
     await database.init_db()
     # Start scheduler for background jobs
     scheduler.start()
+    await restore_unlock_jobs()
 
     # Shutdown handler for graceful cleanup
     @dp.shutdown()
