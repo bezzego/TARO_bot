@@ -4,12 +4,14 @@
 символов) или символ «<» (ломал HTML-разметку). Теперь текст экранируется,
 а длинные поля уходят отдельными сообщениями перед карточкой.
 """
+import asyncio
 import json
 import logging
 import re
 from datetime import datetime
 from html import escape
 
+from aiogram.exceptions import TelegramRetryAfter
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
 
 import bot_texts
@@ -21,8 +23,13 @@ CHUNK_RAW = 3000    # кусок исходного текста; после э�
 
 
 async def _call(method, **kwargs):
-    """Вызов Bot API в админ-группу с повтором при миграции группы и сбое сети."""
+    """Вызов Bot API в админ-группу с повтором при миграции группы, сбое сети и лимите частоты."""
     try:
+        return await method(chat_id=config.ADMIN_GROUP_ID, **kwargs)
+    except TelegramRetryAfter as e:
+        # В группу можно ~20 сообщений в минуту: ждём, сколько просит Telegram
+        logging.warning(f"Flood control, waiting {e.retry_after}s")
+        await asyncio.sleep(e.retry_after + 1)
         return await method(chat_id=config.ADMIN_GROUP_ID, **kwargs)
     except Exception as e:
         err = str(e)
