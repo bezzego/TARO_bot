@@ -12,7 +12,7 @@ from datetime import datetime
 from html import escape
 
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto, ReplyParameters
 
 import bot_texts
 import config
@@ -77,30 +77,35 @@ async def send_booking_to_admin(booking_id, receipt_file_id=None, payment_info="
     username = d["username"] or ""
     user_name = d["user_name"] or ""
 
-    # Фото участников
+    # Фото участников и чек — одним альбомом (чек последним), подпись на первом фото
     try:
         photos = json.loads(d["photos"]) if d["photos"] else []
     except ValueError:
         photos = []
-    for i in range(0, len(photos), 10):  # в альбоме максимум 10 фото
-        media = [InputMediaPhoto(media=pid) for pid in photos[i:i + 10]]
-        if i == 0:
-            label = "созвон" if d["kind"] == "call" else "запись"
-            media[0] = InputMediaPhoto(media=photos[0], caption=f"Фото участников ({label} #{booking_id})")
-        try:
-            await _call(config.bot.send_media_group, media=media)
-        except Exception as e:
-            logging.error(f"Failed to send participant photos for booking {booking_id}: {e}")
-
-    # Чек
+    files = photos + ([receipt_file_id] if receipt_file_id else [])
+    label = "📞 Созвон" if d["kind"] == "call" else "📌 Запись"
+    caption = f"{label} #{booking_id} · @{username or user_name}\n🖼 Фото участников: {len(photos)}"
     if receipt_file_id:
-        caption = f"{'📞 Созвон. ' if d['kind'] == 'call' else ''}Чек от @{username or user_name}"
+        caption += "\n🧾 Чек — последнее фото"
         if payment_info:
-            caption += f"\n{payment_info}"
+            caption += f"\n💳 {payment_info}"
+    album_msg_id = None
+    for i in range(0, len(files), 10):  # в альбоме максимум 10 фото
+        part = files[i:i + 10]
+        cap = escape(caption[:1000]) if i == 0 else None
         try:
-            await _call(config.bot.send_photo, photo=receipt_file_id, caption=escape(caption[:1000]))
+            if len(part) == 1:
+                sent = await _call(config.bot.send_photo, photo=part[0], caption=cap)
+                first_id = sent.message_id
+            else:
+                media = [InputMediaPhoto(media=fid) for fid in part]
+                if cap:
+                    media[0] = InputMediaPhoto(media=part[0], caption=cap)
+                sent = await _call(config.bot.send_media_group, media=media)
+                first_id = sent[0].message_id if sent else None
+            album_msg_id = album_msg_id or first_id
         except Exception as e:
-            logging.error(f"Failed to send receipt photo for booking {booking_id}: {e}")
+            logging.error(f"Failed to send photos/receipt for booking {booking_id}: {e}")
 
     # Карточка
     try:
@@ -143,7 +148,9 @@ async def send_booking_to_admin(booking_id, receipt_file_id=None, payment_info="
         card = header + "📖 История, участники и вопросы — в сообщениях выше ⬆️\n\n" + footer
 
     try:
-        sent = await _call(config.bot.send_message, text=card, reply_markup=admin_kb(booking_id))
+        extra = ({"reply_parameters": ReplyParameters(message_id=album_msg_id, allow_sending_without_reply=True)}
+                 if album_msg_id else {})
+        sent = await _call(config.bot.send_message, text=card, reply_markup=admin_kb(booking_id), **extra)
         await database.set_booking_admin_message_id(booking_id, sent.message_id)
         return True
     except Exception as e:
