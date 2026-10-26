@@ -6,14 +6,18 @@ from datetime import datetime, timedelta
 from aiogram import Router
 from aiogram import F
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import Message, CallbackQuery
+from aiogram.types import Message, CallbackQuery, InputMediaPhoto, BufferedInputFile
 import admin_keyboard as keyboards
 import keyboards as keyboards_user
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 
+import json
+
+import bot_texts
 import config
 import database
+import excel_export
 from states import AdminState
 
 try:
@@ -104,8 +108,14 @@ async def _main_menu_payload():
         lines.append(f"💳 Ждут оплаты: {waiting}")
     if stale:
         lines.append(f"🕰 Просрочены без оплаты: {stale} (в «Все записи»)")
+    cur = await database.db.execute(
+        "SELECT COUNT(*) AS n FROM bookings b LEFT JOIN slots s ON b.slot_id=s.id "
+        "WHERE b.kind='call' AND b.status IN (?, ?) AND COALESCE(s.date, b.slot_date_cache) >= ?",
+        (config.STATUS_CHECKING, config.STATUS_CONFIRMED, today))
+    calls = (await cur.fetchone())["n"]
     lines += [
         f"✅ Подтверждено (впереди): {confirmed}",
+        f"📞 Созвонов впереди: {calls}",
         f"🟢 Свободных слотов: {free}",
         f"💰 Цена вопроса: {price} ₽",
     ]
@@ -303,7 +313,7 @@ async def admin_price_change(callback: CallbackQuery):
 
 async def _load_bookings():
     cur = await database.db.execute(
-        "SELECT COALESCE(s.date, b.slot_date_cache) AS date, "
+        "SELECT b.id, COALESCE(s.date, b.slot_date_cache) AS date, "
         "COALESCE(s.time, b.slot_time_cache) AS time, "
         "b.status, u.name AS user_name, u.username AS username, b.kind, b.call_minutes "
         "FROM bookings b JOIN users u ON b.user_id = u.user_id "
@@ -312,34 +322,53 @@ async def _load_bookings():
     return await cur.fetchall()
 
 
+def _time_label(rec):
+    """«13:00» для расклада, «13:00–14:00» для созвона."""
+    t = rec["time"] or "--:--"
+    if rec["kind"] == "call" and rec["time"] and rec["call_minutes"]:
+        t = f"{t}–{database._add_minutes(t, rec['call_minutes'])}"
+    return t
+
+
+TYPE_TITLES = {"all": "все", "spread": "🔮 расклады", "call": "📞 созвоны"}
+
+
 @router.callback_query(F.data.startswith("admin|bookings"))
 async def admin_bookings_cb(callback: CallbackQuery):
     if not is_admin(callback.from_user.id):
         await callback.answer(); return
+    # admin|bookings|<фильтр>|<страница>|<тип>
     parts = callback.data.split("|")
     flt = parts[2] if len(parts) > 2 and parts[2] in ("chk", "act", "all") else "act"
     try:
-        page = int(parts[3]) if len(parts) > 3 else (int(parts[2]) if len(parts) > 2 else 0)
+        page = int(parts[3]) if len(parts) > 3 else 0
     except ValueError:
         page = 0
+    typ = parts[4] if len(parts) > 4 and parts[4] in TYPE_TITLES else "all"
 
     today = _today_iso()
     records = await _load_bookings()
+    type_counts = {
+        "spread": sum(1 for r in records if r["kind"] != "call"),
+        "call": sum(1 for r in records if r["kind"] == "call"),
+    }
+    if typ == "call":
+        records = [r for r in records if r["kind"] == "call"]
+    elif typ == "spread":
+        records = [r for r in records if r["kind"] != "call"]
     sets = {
-        "chk": [r for r in records if r["status"] == config.STATUS_CHECKING],
+        "chk": [r for r in records if r["status"] == config.STATUS_CHECKING][::-1],  # свежие сверху
         "act": [r for r in records if r["status"] in ACTIVE_STATUSES and (r["date"] or "9999") >= today],
-        "all": list(records),
+        "all": list(records)[::-1],  # свежие сверху
     }
     counts = {k: len(v) for k, v in sets.items()}
     items = sets[flt]
-    if flt == "all":
-        items = items[::-1]  # свежие сверху
     total_pages = max(1, (len(items) + BOOKINGS_PAGE_SIZE - 1) // BOOKINGS_PAGE_SIZE)
     page = min(max(page, 0), total_pages - 1)
     chunk = items[page * BOOKINGS_PAGE_SIZE:(page + 1) * BOOKINGS_PAGE_SIZE]
 
     titles = {"chk": "⏳ Ждут проверки оплаты", "act": "📅 Актуальные записи", "all": "🗂 Все записи"}
-    lines = [f"📋 <b>{titles[flt]}</b>", ""]
+    lines = [f"📋 <b>{titles[flt]}</b> · {TYPE_TITLES[typ]}", ""]
     if not chunk:
         lines.append("Пока пусто ✨")
     last_date = object()
@@ -351,10 +380,144 @@ async def admin_bookings_cb(callback: CallbackQuery):
             lines.append(f"<b>{_fmt_date(rec['date'])}</b>" if rec["date"] else "<b>Дата не указана</b>")
         st = STATUS_TEXT.get(rec["status"], escape(str(rec["status"])))
         call = f"📞 <b>СОЗВОН {rec['call_minutes']} мин</b> · " if rec["kind"] == "call" else ""
-        lines.append(f"  {rec['time'] or '--:--'} · {call}{_client(rec['user_name'], rec['username'])}\n      {st}")
-    kb = keyboards.build_bookings_ilkb(flt, page, total_pages, counts)
+        lines.append(f"  {_time_label(rec)} · {call}{_client(rec['user_name'], rec['username'])}\n      {st}")
+    if chunk:
+        lines += ["", "<i>Нажмите на запись ниже, чтобы открыть историю, фото и чек.</i>"]
+
+    buttons = []
+    for rec in chunk:
+        icon = "📞" if rec["kind"] == "call" else "🔮"
+        buttons.append((rec["id"], f"{icon} {_fmt_date(rec['date'])} {_time_label(rec)} · {(rec['user_name'] or rec['username'] or '—')[:18]}"))
+    kb = keyboards.build_bookings_ilkb(flt, page, total_pages, counts, typ, type_counts, buttons)
     await _show(callback, "\n".join(lines), kb)
     await callback.answer()
+
+
+# ---- Карточка записи ----
+
+def _cut(text, limit):
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+async def _show_booking_card(callback: CallbackQuery, booking_id: int, back: str):
+    d = await database.get_booking_details(booking_id)
+    if not d:
+        await callback.answer("Запись не найдена", show_alert=True)
+        return
+    is_call = d["kind"] == "call"
+    title = (f"📞 <b>СОЗВОН · {bot_texts.call_duration(d['call_minutes'])}</b> · запись #{booking_id}"
+             if is_call else f"🔮 <b>Расклад</b> · запись #{booking_id}")
+    try:
+        photos = json.loads(d["photos"]) if d["photos"] else []
+    except ValueError:
+        photos = []
+    head = [
+        title, "",
+        f"📅 {_fmt_date(d['date'])} · ⏰ {_time_label(d)}",
+        f"👤 {_client(d['user_name'], d['username'])}",
+        f"📞 {escape(d['phone'] or '—')}",
+        f"💵 {d['amount']} ₽ · {STATUS_TEXT.get(d['status'], escape(str(d['status'])))}",
+    ]
+    if d["payment_info"]:
+        head.append(f"💳 {escape(d['payment_info'])}")
+    head.append(f"🖼 Фото участников: {len(photos)} · чек: {'есть' if d['receipt_file_id'] else 'нет'}")
+    head.append("")
+    # Длинные поля обрезаем, чтобы карточка влезла в лимит Telegram
+    budget = 3600 - len("\n".join(head))
+    story, participants, questions = d["story"] or "", d["participants"] or "", d["questions"] or ""
+    q_part = max(600, budget // 3)
+    body = (
+        f"👥 <b>Участники:</b>\n{escape(_cut(participants, 400))}\n\n"
+        f"💬 <b>Вопросы ({d['num_questions']}):</b>\n{escape(_cut(questions, q_part))}\n\n"
+        f"📖 <b>История:</b>\n{escape(_cut(story, max(500, budget - q_part - 500)))}"
+    )
+    text = "\n".join(head) + "\n" + body
+    kb = keyboards.build_booking_card_ilkb(
+        booking_id, back, d["status"] == config.STATUS_CHECKING,
+        bool(photos or d["receipt_file_id"]), d["username"])
+    await _show(callback, text, kb)
+
+
+def _back_from(parts):
+    back = "|".join(parts)
+    return back if back else "act|0|all"
+
+
+@router.callback_query(F.data.startswith("bk|"))
+async def admin_booking_card(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    parts = callback.data.split("|")
+    await _show_booking_card(callback, int(parts[1]), _back_from(parts[2:]))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bkph|"))
+async def admin_booking_media(callback: CallbackQuery):
+    """Присылает в этот чат фото участников и чек."""
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    booking_id = int(callback.data.split("|")[1])
+    d = await database.get_booking_details(booking_id)
+    if not d:
+        await callback.answer("Запись не найдена", show_alert=True); return
+    chat_id = callback.message.chat.id
+    try:
+        photos = json.loads(d["photos"]) if d["photos"] else []
+    except ValueError:
+        photos = []
+    await callback.answer("Отправляю…")
+    for i in range(0, len(photos), 10):
+        media = [InputMediaPhoto(media=p) for p in photos[i:i + 10]]
+        if i == 0:
+            media[0] = InputMediaPhoto(media=photos[0], caption=f"Фото участников · запись #{booking_id}")
+        try:
+            await config.bot.send_media_group(chat_id, media=media)
+        except Exception as e:
+            logging.error(f"Failed to send photos of booking {booking_id} to admin: {e}")
+    if d["receipt_file_id"]:
+        cap = f"Чек · запись #{booking_id}" + (f"\n{d['payment_info']}" if d["payment_info"] else "")
+        try:
+            await config.bot.send_photo(chat_id, d["receipt_file_id"], caption=escape(cap[:1000]))
+        except Exception as e:
+            logging.error(f"Failed to send receipt of booking {booking_id} to admin: {e}")
+    elif d["admin_message_id"]:
+        await config.bot.send_message(chat_id, f"Чек записи #{booking_id} пришёл до обновления бота — он есть только в админ-группе.")
+
+
+@router.callback_query(F.data.startswith("bkok|") | F.data.startswith("bkno|"))
+async def admin_booking_decide(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    parts = callback.data.split("|")
+    booking_id = int(parts[1])
+    confirm = parts[0] == "bkok"
+    ok, details = await (confirm_booking(booking_id) if confirm else reject_booking(booking_id))
+    if not ok:
+        await callback.answer("Статус уже изменился — обновляю карточку.", show_alert=True)
+    else:
+        await _mark_group_card(details, "подтверждена ✅" if confirm else "отклонена ❌")
+        await callback.answer("✅ Подтверждено" if confirm else "❌ Отклонено")
+    await _show_booking_card(callback, booking_id, _back_from(parts[2:]))
+
+
+# ---- Выгрузка в Excel ----
+
+@router.callback_query(F.data == "admin|excel")
+async def admin_excel(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    await callback.answer("Готовлю файл…")
+    try:
+        data = await excel_export.build_bookings_xlsx()
+    except Exception as e:
+        logging.exception(f"Excel export failed: {e}")
+        await callback.message.answer("Не удалось собрать файл, подробности в логах.")
+        return
+    name = f"zapisi_{_now().strftime('%Y-%m-%d')}.xlsx"
+    await config.bot.send_document(callback.message.chat.id, BufferedInputFile(data, filename=name),
+                                   caption="📥 Все записи: лист «Записи» (с фильтрами), «Итоги по месяцам».")
 
 
 # ---- Разблокировка слотов ----
@@ -750,87 +913,98 @@ def _with_status(msg: Message, status: str) -> str:
     return f"{html}\nСтатус: {status}"
 
 
-# Admin: confirm payment (from inline button in admin group)
-@router.callback_query(lambda c: c.data and c.data.startswith('confirm|'))
-async def confirm_payment(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    try:
-        booking_id = int(callback.data.split('|')[1])
-    except:
-        await callback.answer()
-        return
+async def confirm_booking(booking_id: int):
+    """Подтверждает оплату и уведомляет клиента. Возвращает (ok, details)."""
     details = await database.get_booking_details(booking_id)
     if not details or details["status"] != config.STATUS_CHECKING:
-        await callback.answer("Не удалось подтвердить (статус изменился).", show_alert=True)
-        return
-    # Mark as confirmed
+        return False, details
     await database.update_booking_status(booking_id, config.STATUS_CONFIRMED)
-    # Cancel any pending unlock job
     from scheduler import scheduler
     try:
         scheduler.remove_job(f"unlock_{booking_id}")
-    except:
+    except Exception:
         pass
-    user_id = details["user_id"]
-    date = details["date"]; time = details["time"]
-    date_disp = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
-    # Notify user
+    date_disp = datetime.strptime(details["date"], "%Y-%m-%d").strftime("%d.%m.%Y")
+    time = details["time"]
+    if details["kind"] == "call":
+        end = database._add_minutes(time, details["call_minutes"])
+        text = f"Ваша запись на созвон подтверждена: {date_disp} с {time} до {end} (МСК)."
+    else:
+        text = f"Ваша запись подтверждена, расклад будет отправлен {date_disp} с 13:00 до 18:00 (МСК)."
     try:
-        if details["kind"] == "call":
-            end = database._add_minutes(time, details["call_minutes"])
-            text = f"Ваша запись на созвон подтверждена: {date_disp} с {time} до {end} (МСК)."
-        else:
-            text = f"Ваша запись подтверждена, расклад будет отправлен {date_disp} с 13:00 до 18:00 (МСК)."
-        await config.bot.send_message(user_id, text)
+        await config.bot.send_message(details["user_id"], text)
     except Exception as e:
-        logging.error(f"Failed to notify user {user_id} of confirmation: {e}")
-    # Update admin group's message text
-    if details["admin_message_id"]:
-        try:
-            await callback.message.edit_text(_with_status(callback.message, "Подтверждена"))
-        except Exception as e:
-            logging.error(f"Failed to edit admin group message text: {e}")
-    await callback.answer("✅ Подтверждено")
+        logging.error(f"Failed to notify user {details['user_id']} of confirmation: {e}")
+    return True, details
 
-# Admin: reject payment (from inline button in admin group)
-@router.callback_query(lambda c: c.data and c.data.startswith('reject|'))
-async def reject_payment(callback: CallbackQuery):
-    if not is_admin(callback.from_user.id):
-        await callback.answer()
-        return
-    try:
-        booking_id = int(callback.data.split('|')[1])
-    except:
-        await callback.answer()
-        return
+
+async def reject_booking(booking_id: int):
+    """Отклоняет оплату, освобождает слоты, уведомляет клиента. Возвращает (ok, details)."""
     details = await database.get_booking_details(booking_id)
     if not details or details["status"] != config.STATUS_CHECKING:
-        await callback.answer("Не удалось отклонить (статус изменился).", show_alert=True)
-        return
-    # Temporary debug log for details keys
-    logging.debug(f"reject_payment details keys: {list(details.keys())}")
-    # Mark as rejected and free slot
+        return False, details
     await database.update_booking_status(booking_id, config.STATUS_REJECTED)
     record = await database.get_booking_by_id(booking_id)
     if record and database.booking_slot_ids(record):
         await database.free_booking_slots(record)
         await database.db.commit()
     else:
-        logging.error(f"reject_payment: no slots for booking {booking_id}")
-    user_id = details["user_id"]
-    date = details["date"]; time = details["time"]
-    date_disp = datetime.strptime(date, "%Y-%m-%d").strftime("%d.%m.%Y")
-    # Notify user
+        logging.error(f"reject_booking: no slots for booking {booking_id}")
     try:
-        await config.bot.send_message(user_id, "Ваш платеж не подтвержден. Запись отклонена, слот освобожден. Вы можете записаться снова.")
+        await config.bot.send_message(details["user_id"], "Ваш платеж не подтвержден. Запись отклонена, слот освобожден. Вы можете записаться снова.")
     except Exception as e:
-        logging.error(f"Failed to notify user {user_id} of rejection: {e}")
-    # Update admin group's message text
-    if details["admin_message_id"]:
-        try:
-            await callback.message.edit_text(_with_status(callback.message, "Отклонена"))
-        except Exception as e:
-            logging.error(f"Failed to edit admin group message text on reject: {e}")
-    await callback.answer("❌ Отклонено", show_alert=False)
+        logging.error(f"Failed to notify user {details['user_id']} of rejection: {e}")
+    return True, details
+
+
+async def _mark_group_card(details, status: str):
+    """Решение принято из админки: снимаем кнопки с карточки в группе и отвечаем на неё."""
+    if not details["admin_message_id"] or not config.ADMIN_GROUP_ID:
+        return
+    try:
+        await config.bot.edit_message_reply_markup(chat_id=config.ADMIN_GROUP_ID,
+                                                   message_id=details["admin_message_id"], reply_markup=None)
+        await config.bot.send_message(config.ADMIN_GROUP_ID, f"Запись #{details['id']}: {status} (из админ-панели)",
+                                      reply_to_message_id=details["admin_message_id"])
+    except Exception as e:
+        logging.error(f"Failed to mark group card for booking {details['id']}: {e}")
+
+
+# Admin: confirm payment (from inline button in admin group)
+@router.callback_query(F.data.startswith("confirm|"))
+async def confirm_payment(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    try:
+        booking_id = int(callback.data.split("|")[1])
+    except ValueError:
+        await callback.answer(); return
+    ok, details = await confirm_booking(booking_id)
+    if not ok:
+        await callback.answer("Не удалось подтвердить (статус изменился).", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text(_with_status(callback.message, "Подтверждена"))
+    except Exception as e:
+        logging.error(f"Failed to edit admin group message text: {e}")
+    await callback.answer("✅ Подтверждено")
+
+
+# Admin: reject payment (from inline button in admin group)
+@router.callback_query(F.data.startswith("reject|"))
+async def reject_payment(callback: CallbackQuery):
+    if not is_admin(callback.from_user.id):
+        await callback.answer(); return
+    try:
+        booking_id = int(callback.data.split("|")[1])
+    except ValueError:
+        await callback.answer(); return
+    ok, details = await reject_booking(booking_id)
+    if not ok:
+        await callback.answer("Не удалось отклонить (статус изменился).", show_alert=True)
+        return
+    try:
+        await callback.message.edit_text(_with_status(callback.message, "Отклонена"))
+    except Exception as e:
+        logging.error(f"Failed to edit admin group message text on reject: {e}")
+    await callback.answer("❌ Отклонено")

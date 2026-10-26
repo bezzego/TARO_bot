@@ -598,6 +598,7 @@ async def receive_receipt(message: Message, state: FSMContext):
         await state.clear()
         return
     # Update status to "CHECKING" (awaiting admin confirmation)
+    await database.set_booking_receipt(booking_id, message.photo[-1].file_id, data.get("payment_info", ""))
     await database.update_booking_status(booking_id, config.STATUS_CHECKING)
     # Cancel the scheduled unlock job
     from scheduler import scheduler

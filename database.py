@@ -79,7 +79,8 @@ async def init_db():
     # kind — 'call' для созвона (NULL = обычный расклад), call_minutes — длительность,
     # extra_slots — остальные слоты созвона в виде ",12,13," (первый слот — slot_id)
     for column, col_type in (("slot_date_cache", "TEXT"), ("slot_time_cache", "TEXT"), ("created_at", "TEXT"),
-                             ("kind", "TEXT"), ("call_minutes", "INTEGER"), ("extra_slots", "TEXT")):
+                             ("kind", "TEXT"), ("call_minutes", "INTEGER"), ("extra_slots", "TEXT"),
+                             ("receipt_file_id", "TEXT"), ("payment_info", "TEXT")):
         try:
             await db.execute(f"ALTER TABLE bookings ADD COLUMN {column} {col_type}")
             logging.info(f"Added missing column {column} to bookings table")
@@ -281,7 +282,7 @@ async def get_booking_by_id(booking_id: int):
 async def get_booking_details(booking_id: int):
     """Get detailed booking info joined with user and slot."""
     query = """SELECT b.id, b.status, b.num_questions, b.amount, b.story, b.participants, b.questions, b.photos, b.admin_message_id,
-                      b.kind, b.call_minutes,
+                      b.kind, b.call_minutes, b.receipt_file_id, b.payment_info, b.slot_id, b.extra_slots,
                       u.name as user_name, u.username as username, u.phone as phone,
                       COALESCE(s.date, b.slot_date_cache) as date,
                       COALESCE(s.time, b.slot_time_cache) as time,
@@ -296,6 +297,12 @@ async def get_booking_details(booking_id: int):
 async def update_booking_status(booking_id: int, new_status: str):
     """Update booking status."""
     await db.execute("UPDATE bookings SET status=? WHERE id=?", (new_status, booking_id))
+    await db.commit()
+
+async def set_booking_receipt(booking_id: int, receipt_file_id: str, payment_info: str):
+    """Сохраняет чек и данные перевода, чтобы их можно было открыть из админки."""
+    await db.execute("UPDATE bookings SET receipt_file_id=?, payment_info=? WHERE id=?",
+                     (receipt_file_id, payment_info, booking_id))
     await db.commit()
 
 async def set_booking_admin_message_id(booking_id: int, message_id: int):

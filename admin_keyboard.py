@@ -30,8 +30,9 @@ def build_admin_main_ilkb(checking=0, waiting=0):
             ],
             [
                 _btn("💰 Цена", "admin|price"),
-                _btn("🔄 Обновить", "admin|menu"),
+                _btn("📥 Excel", "admin|excel"),
             ],
+            [_btn("🔄 Обновить", "admin|menu")],
         ]
     )
 
@@ -94,23 +95,48 @@ def build_price_menu_ilkb(current_price):
     )
 
 
-def build_bookings_ilkb(flt, page, total_pages, counts):
-    """counts: словарь {'act': n, 'chk': n, 'all': n}."""
+def build_bookings_ilkb(flt, page, total_pages, counts, typ, type_counts, items):
+    """counts: {'chk'|'act'|'all': n} для текущего типа; type_counts: {'spread'|'call': n};
+    items: [(booking_id, подпись)] — записи текущей страницы, кнопками."""
+    def nav_data(f=flt, p=0, t=typ):
+        return f"admin|bookings|{f}|{p}|{t}"
+
+    def type_btn(key, title):
+        active = key == typ
+        # Повторное нажатие на активный тип возвращает «все типы»
+        return _btn(f"{'● ' if active else ''}{title} · {type_counts.get(key, 0)}",
+                    nav_data(t="all" if active else key))
+
     def tab(key, title):
         text = f"● {title} · {counts.get(key, 0)}" if key == flt else f"{title} · {counts.get(key, 0)}"
-        return [_btn(text, f"admin|bookings|{key}|0")]
+        return [_btn(text, nav_data(f=key))]
 
-    rows = [tab("chk", "⏳ Ждут проверки"), tab("act", "📅 Актуальные"), tab("all", "🗂 Все записи")]
+    rows = [[type_btn("spread", "🔮 Расклады"), type_btn("call", "📞 Созвоны")]]
+    rows += [tab("chk", "⏳ Ждут проверки"), tab("act", "📅 Актуальные"), tab("all", "🗂 Все записи")]
+    rows += [[_btn(label, f"bk|{bid}|{flt}|{page}|{typ}")] for bid, label in items]
     nav = []
     if page > 0:
-        nav.append(_btn("◀️", f"admin|bookings|{flt}|{page - 1}"))
+        nav.append(_btn("◀️", nav_data(p=page - 1)))
     if total_pages > 1:
         nav.append(_btn(f"{page + 1}/{total_pages}", "noop"))
     if page < total_pages - 1:
-        nav.append(_btn("▶️", f"admin|bookings|{flt}|{page + 1}"))
+        nav.append(_btn("▶️", nav_data(p=page + 1)))
     if nav:
         rows.append(nav)
-    rows.append([BTN_MENU])
+    rows.append([_btn("📥 Excel", "admin|excel"), BTN_MENU])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def build_booking_card_ilkb(booking_id, back, checking, has_media, username):
+    rows = []
+    if checking:
+        rows.append([_btn("✅ Подтвердить", f"bkok|{booking_id}|{back}"),
+                     _btn("❌ Отклонить", f"bkno|{booking_id}|{back}")])
+    if has_media:
+        rows.append([_btn("🖼 Фото участников и чек", f"bkph|{booking_id}")])
+    if username:
+        rows.append([InlineKeyboardButton(text="💬 Написать клиенту", url=f"https://t.me/{username}")])
+    rows.append([_btn("⬅️ К списку", f"admin|bookings|{back}"), BTN_MENU])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
