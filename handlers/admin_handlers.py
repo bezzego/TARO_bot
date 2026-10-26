@@ -116,7 +116,9 @@ async def _main_menu_payload():
 async def admin_menu_cmd(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
-    await state.clear()
+    # Сбрасываем только незаконченный ввод админки; начатую запись на расклад/созвон не трогаем
+    if (await state.get_state() or "").startswith("AdminState"):
+        await state.clear()
     text, kb = await _main_menu_payload()
     await message.answer(text, reply_markup=kb)
 

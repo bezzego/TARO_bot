@@ -24,6 +24,11 @@ admin_menu_kb = ReplyKeyboardMarkup(
 )
 
 
+# Тексты кнопок меню: шаги записи их не принимают как ответ,
+# чтобы нажатие кнопки посреди записи срабатывало как кнопка
+MENU_TEXTS = {b.text for row in admin_menu_kb.keyboard for b in row}
+
+
 def menu_for(user_id: int) -> ReplyKeyboardMarkup:
     """Главное меню с учётом роли пользователя."""
     return admin_menu_kb if user_id in config.ADMIN_IDS else main_menu_kb

@@ -17,6 +17,9 @@ from states import BookingState, ChooseQuestionState
 
 router = Router()
 
+# Нажатие кнопки меню не считается ответом на шаг записи
+NOT_MENU = ~F.text.in_(keyboards.MENU_TEXTS)
+
 # Cancel command handler to abort the booking process
 @router.message(F.text.lower() == "/cancel")
 async def cancel_command(message: Message, state: FSMContext):
@@ -193,7 +196,7 @@ async def question_category_callback(callback: CallbackQuery, state: FSMContext)
     await callback.answer()
 
 
-@router.message(ChooseQuestionState.enter_numbers, F.text)
+@router.message(ChooseQuestionState.enter_numbers, F.text, NOT_MENU)
 async def receive_question_numbers(message: Message, state: FSMContext):
     data = await state.get_data()
     questions = data.get("question_list", [])
@@ -301,7 +304,7 @@ async def book_call_duration(callback: CallbackQuery, state: FSMContext):
 
 
 # State: waiting for the story of the situation
-@router.message(BookingState.story)
+@router.message(BookingState.story, NOT_MENU)
 async def receive_story(message: Message, state: FSMContext):
     if not message.text or message.text.strip() == "":
         await message.answer("Опишите, пожалуйста, вашу ситуацию.")
@@ -311,7 +314,7 @@ async def receive_story(message: Message, state: FSMContext):
     await state.set_state(BookingState.participants)
 
 # State: waiting for participants' names
-@router.message(BookingState.participants)
+@router.message(BookingState.participants, NOT_MENU)
 async def receive_participants(message: Message, state: FSMContext):
     if not message.text or message.text.strip() == "":
         await message.answer("Введите имена участников (например: Иван, Мария, ...).")
@@ -322,7 +325,7 @@ async def receive_participants(message: Message, state: FSMContext):
     await state.set_state(BookingState.photos)
 
 # State: waiting for photos of participants and then "Готово"
-@router.message(BookingState.photos)
+@router.message(BookingState.photos, NOT_MENU)
 async def receive_photos(message: Message, state: FSMContext):
     if message.photo:
         # Collect photo file_id
@@ -358,7 +361,7 @@ async def receive_photos(message: Message, state: FSMContext):
         await message.answer("Отправьте фото участников и нажмите «Готово», когда закончите.")
 
 # State: waiting for list of questions
-@router.message(BookingState.questions)
+@router.message(BookingState.questions, NOT_MENU)
 async def receive_questions(message: Message, state: FSMContext):
     if not message.text or message.text.strip() == "":
         await message.answer("Введите, пожалуйста, ваши вопросы (каждый вопрос с новой строки).")
@@ -386,7 +389,7 @@ async def receive_questions(message: Message, state: FSMContext):
     await state.set_state(BookingState.phone)
 
 # State: waiting for phone contact or manual input
-@router.message(BookingState.phone)
+@router.message(BookingState.phone, NOT_MENU)
 async def receive_phone(message: Message, state: FSMContext):
     phone_number = None
     if message.contact:
@@ -409,6 +412,8 @@ async def receive_phone(message: Message, state: FSMContext):
         return
     # Save phone and update user record
     user = message.from_user
+    # Обновляем имя и юзернейм: по ним админ ищет клиента, а с /start он мог их сменить
+    await database.get_or_create_user(user.id, user.username, user.full_name)
     await database.update_user_phone(user.id, phone_number)
     await state.update_data(phone=phone_number)
     # Show available dates
@@ -566,7 +571,7 @@ async def select_time_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 # State: waiting for payment info
-@router.message(BookingState.payment_info)
+@router.message(BookingState.payment_info, NOT_MENU)
 async def receive_payment_info(message: Message, state: FSMContext):
     if not message.text or message.text.strip() == "":
         await message.answer("Пожалуйста, укажите от кого перевод и на какую карту.")
@@ -576,7 +581,7 @@ async def receive_payment_info(message: Message, state: FSMContext):
     await state.set_state(BookingState.waiting_receipt)
 
 # State: waiting for payment receipt photo
-@router.message(BookingState.waiting_receipt)
+@router.message(BookingState.waiting_receipt, NOT_MENU)
 async def receive_receipt(message: Message, state: FSMContext):
     if not message.photo:
         await message.answer("Пожалуйста, отправьте фотографию чека об оплате.")
